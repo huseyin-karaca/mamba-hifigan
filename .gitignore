@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+site/
+.venv/
+venv/
+.DS_Store
+results/hifi_gan/
+LJSpeech-1.1/
+*.ckpt

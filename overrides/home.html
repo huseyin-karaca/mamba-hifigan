@@ -1,0 +1,55 @@
+{#-
+  The home page: the hero (status, title, authors, summary, links and the figure), then the content of index.md in
+  a single reading column. The figure is the gated-fusion diagram, docs/snippets/fig_gated.html.
+-#}
+{% extends "main.html" %}
+
+{% block extrahead %}
+  {{ super() }}
+  <meta name="citation_title" content="Integrating Bidirectional Mamba into HiFi-GAN for Long-Range Speech Synthesis">
+  <meta name="citation_author" content="Huseyin Karaca">
+  <meta name="citation_author" content="Rabia Ela Unlu">
+  <meta name="citation_author" content="Emre Can Yayla">
+  <meta name="citation_publication_date" content="2025">
+  <meta name="citation_pdf_url" content="https://hkaraca.com/mamba-hifigan/assets/report.pdf">
+  <meta name="citation_abstract_html_url" content="https://hkaraca.com/mamba-hifigan/">
+{% endblock %}
+
+{% block tabs %}
+  {{ super() }}
+  <section class="mh-hero">
+    <div class="md-grid mh-hero__grid">
+      <div class="mh-hero__text">
+        <p class="mh-hero__status">CS 585 term project &middot; Bilkent University &middot; Fall 2025</p>
+        <h1>Mamba HiFi-GAN</h1>
+        <p class="mh-hero__subtitle">Adaptive gated fusion of convolutional and bidirectional-SSM branches in a neural vocoder</p>
+        <p class="mh-hero__authors">H&uuml;seyin Karaca, Rabia Ela &Uuml;nl&uuml;, Emre Can Yayla</p>
+        <p class="mh-hero__affil">Department of Electrical and Electronics Engineering, Bilkent University</p>
+        <p class="mh-hero__tldr">
+          HiFi-GAN's convolutions model speech texture well but see only a bounded window. We tried nineteen ways
+          of giving the generator a bidirectional state-space branch as well, and measured all of them. Most made
+          things worse, in three distinct ways. The one that helped mixes the two branches with a weight the
+          network learns for itself.
+        </p>
+        <div class="mh-hero__actions">
+          <a class="mh-btn" href="{{ 'assets/report.pdf' | url }}">Report</a>
+          <a class="mh-btn" href="{{ 'assets/slides.pdf' | url }}">Slides</a>
+          <a class="mh-btn" href="{{ config.repo_url }}">Code</a>
+          <a class="mh-btn mh-btn--primary" href="{{ 'listen/' | url }}">Listen</a>
+          <a class="mh-btn" href="{{ 'experiments/' | url }}">Every run</a>
+        </div>
+      </div>
+      <figure class="mh-hero__figure">
+        {% include "partials/hero_figure.html" %}
+      </figure>
+    </div>
+  </section>
+{% endblock %}
+
+{% block container %}
+  <div class="md-content mh-home" data-md-component="content">
+    <article class="md-content__inner md-typeset">
+      {{ page.content }}
+    </article>
+  </div>
+{% endblock %}

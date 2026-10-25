@@ -1,0 +1,45 @@
+<div class="mh-table" markdown="0">
+<table>
+<thead><tr>
+<th>Run</th><th>Generator</th><th class="num">Feat. match ↓</th>
+<th class="num">L1 spec ↓</th><th class="num">d_state</th>
+</tr></thead>
+<tbody>
+<tr class="mh-group"><th class="grp" colspan="5">Baseline</th></tr>
+<tr><td class="sys">Baseline, min duration 0.5 s</td><td><code>OriginalHifiganGenerator</code></td><td class="num">0.0704</td><td class="num">0.2633</td><td class="num">—</td></tr>
+<tr><td class="sys">Baseline, longer segments</td><td><code>OriginalHifiganGenerator</code></td><td class="num">0.0730</td><td class="num">0.2625</td><td class="num">—</td></tr>
+<tr><td class="sys">Baseline HiFi-GAN</td><td><code>OriginalHifiganGenerator</code></td><td class="num">0.0736</td><td class="num">0.2975</td><td class="num">—</td></tr>
+<tr class="mh-group"><th class="grp" colspan="5">Adaptive gated fusion (proposed)</th></tr>
+<tr class="mh-row"><td class="sys">Hybrid 1 gated, Mamba-64</td><td><code>HifiganGeneratorHybrid1GatedFusion</code></td><td class="num best">0.0623</td><td class="num">0.2806</td><td class="num">64</td></tr>
+<tr class="mh-row"><td class="sys">Hybrid 1 gated, Mamba-128</td><td><code>HifiganGeneratorHybrid1GatedFusion</code></td><td class="num">0.0771</td><td class="num best">0.2587</td><td class="num">128</td></tr>
+<tr><td class="sys">MRF-wide gated, Mamba-64</td><td><code>HifiganGeneratorMambaMRF_Gated</code></td><td class="num">0.1346</td><td class="num">0.3087</td><td class="num">64</td></tr>
+<tr class="mh-group"><th class="grp" colspan="5">Parallel branches, fixed fusion</th></tr>
+<tr><td class="sys">Hybrid 2 summation, Mamba-64</td><td><code>HybridHifiganGenerator2</code></td><td class="num">0.0711</td><td class="num">0.2991</td><td class="num">64</td></tr>
+<tr><td class="sys">Hybrid 2 summation, longer segments</td><td><code>HybridHifiganGenerator2</code></td><td class="num">0.0725</td><td class="num">0.2680</td><td class="num">64</td></tr>
+<tr><td class="sys">Hybrid 1 summation, Mamba-64</td><td><code>HifiganGeneratorHybrid1Summation</code></td><td class="num">0.0730</td><td class="num">0.2768</td><td class="num">64</td></tr>
+<tr><td class="sys">Hybrid 1 summation, Mamba-128</td><td><code>HifiganGeneratorHybrid1Summation</code></td><td class="num">0.0737</td><td class="num">0.2659</td><td class="num">128</td></tr>
+<tr><td class="sys">Hybrid 1 summation, longer segments</td><td><code>HifiganGeneratorHybrid1Summation</code></td><td class="num">0.0776</td><td class="num">0.2689</td><td class="num">64</td></tr>
+<tr class="mh-group"><th class="grp" colspan="5">Mamba only</th></tr>
+<tr><td class="sys">Mamba only, no MRF</td><td><code>MambaOnlyHifiganGenerator</code></td><td class="num">0.1291</td><td class="num">0.3307</td><td class="num">64</td></tr>
+<tr><td class="sys">Mamba only, longer segments</td><td><code>MambaOnlyHifiganGenerator</code></td><td class="num">0.1328</td><td class="num">0.3144</td><td class="num">64</td></tr>
+<tr class="mh-group"><th class="grp" colspan="5">Phase coherence failures</th></tr>
+<tr><td class="sys">Dual-path decoupled synthesis</td><td><code>HifiganGeneratorDualPath</code></td><td class="num">0.0857</td><td class="num">0.3647</td><td class="num">128</td></tr>
+<tr><td class="sys">Post-net waveform refinement</td><td><code>HifiganGeneratorWithPostNet</code></td><td class="num">0.0958</td><td class="num">0.3313</td><td class="num">128</td></tr>
+<tr><td class="sys">Multi-rate hybrid</td><td><code>HifiganGeneratorMultiRate</code></td><td class="num">0.1695</td><td class="num">0.7068</td><td class="num">128</td></tr>
+<tr class="mh-group"><th class="grp" colspan="5">Gradient instability failures</th></tr>
+<tr><td class="sys">FiLM modulation</td><td><code>HifiganGeneratorMambaFiLM</code></td><td class="num">0.0864</td><td class="num">0.3068</td><td class="num">128</td></tr>
+<tr><td class="sys">Sequential progressive</td><td><code>HifiganGeneratorSequentialProgressive</code></td><td class="num">0.1632</td><td class="num">0.3553</td><td class="num">128</td></tr>
+<tr><td class="sys">Squeeze-excite channel attention</td><td><code>HifiganGeneratorMambaSE</code></td><td class="num">0.1922</td><td class="num">0.4179</td><td class="num">128</td></tr>
+<tr class="mh-group"><th class="grp" colspan="5">Information bottleneck failures</th></tr>
+<tr><td class="sys">Global context broadcasting</td><td><code>HifiganGeneratorBroadcast</code></td><td class="num">0.0699</td><td class="num">0.4479</td><td class="num">128</td></tr>
+<tr><td class="sys">Mel pre-net</td><td><code>HifiganGeneratorWithPreNet</code></td><td class="num">0.0874</td><td class="num">0.3009</td><td class="num">128</td></tr>
+<tr><td class="sys">Spectrogram refinement</td><td><code>HifiganGeneratorSpecRefine</code></td><td class="num">0.1450</td><td class="num">0.4100</td><td class="num">128</td></tr>
+<tr><td class="sys">Channel concatenation</td><td><code>HifiganGeneratorConcat</code></td><td class="num">0.1728</td><td class="num">0.3286</td><td class="num">128</td></tr>
+<tr class="mh-group"><th class="grp" colspan="5">Mamba at some resolutions only</th></tr>
+<tr><td class="sys">Serial within stage</td><td><code>HifiganGeneratorSerial</code></td><td class="num">0.0773</td><td class="num">0.3177</td><td class="num">128</td></tr>
+<tr><td class="sys">Mamba at late stages only</td><td><code>HifiganGeneratorLateMamba</code></td><td class="num">0.0897</td><td class="num">0.3185</td><td class="num">128</td></tr>
+<tr><td class="sys">Mamba at early stages only</td><td><code>HifiganGeneratorBottleneck</code></td><td class="num">0.0963</td><td class="num">0.3276</td><td class="num">128</td></tr>
+</tbody>
+</table>
+<p class="mh-note">Final-epoch validation losses, one run each at 50 epochs, seed 1234. Bold marks the lowest value in the table.</p>
+</div>

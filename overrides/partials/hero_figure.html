@@ -1,0 +1,49 @@
+{#- The hero diagram: one upsampling stage, condensed. The full version is docs/snippets/fig_gated.html. -#}
+<svg class="mh-svg" viewBox="0 0 480 330" role="img" aria-label="One upsampling stage: a bidirectional Mamba branch and the multi-receptive-field branch run in parallel and are mixed by a learnable per-stage weight.">
+  <defs>
+    <marker id="h-ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" class="f-line" fill="#c9ccd3"/>
+    </marker>
+    <marker id="h-gate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" class="f-gate" fill="#7a5bd1"/>
+    </marker>
+  </defs>
+
+  <text x="240" y="18" text-anchor="middle" class="f-muted" fill="#6b7180" font-size="11.5">upsampled features</text>
+  <path d="M240 26 V 44 H 92 V 62" class="s-line" stroke="#c9ccd3" stroke-width="1.6" fill="none" marker-end="url(#h-ar)"/>
+  <path d="M240 26 V 44 H 388 V 62" class="s-line" stroke="#c9ccd3" stroke-width="1.6" fill="none" marker-end="url(#h-ar)"/>
+
+  <rect x="14" y="64" width="156" height="66" rx="8" class="s-mamba" fill="none" stroke="#23977f" stroke-width="1.9"/>
+  <text x="92" y="90" text-anchor="middle" class="f-mamba" fill="#23977f" font-size="13" font-weight="700">Bi-Mamba</text>
+  <text x="92" y="111" text-anchor="middle" class="f-muted" fill="#6b7180" font-size="10.5">global structure</text>
+
+  <rect x="310" y="64" width="156" height="66" rx="8" class="s-conv" fill="none" stroke="#b67b0c" stroke-width="1.9"/>
+  <text x="388" y="90" text-anchor="middle" class="f-conv" fill="#b67b0c" font-size="13" font-weight="700">MRF convolutions</text>
+  <text x="388" y="111" text-anchor="middle" class="f-muted" fill="#6b7180" font-size="10.5">local texture</text>
+
+  <path d="M92 130 V 178" class="s-line" stroke="#c9ccd3" stroke-width="1.6" fill="none" marker-end="url(#h-ar)"/>
+  <path d="M388 130 V 178" class="s-line" stroke="#c9ccd3" stroke-width="1.6" fill="none" marker-end="url(#h-ar)"/>
+
+  <circle cx="92" cy="196" r="15" class="f-bg s-ink2" fill="#ffffff" stroke="#434a5a" stroke-width="1.4"/>
+  <text x="92" y="201" text-anchor="middle" class="f-ink" fill="#1c2230" font-size="14" font-weight="600">&#215;</text>
+  <circle cx="388" cy="196" r="15" class="f-bg s-ink2" fill="#ffffff" stroke="#434a5a" stroke-width="1.4"/>
+  <text x="388" y="201" text-anchor="middle" class="f-ink" fill="#1c2230" font-size="14" font-weight="600">&#215;</text>
+
+  <rect x="162" y="176" width="156" height="40" rx="20" class="f-bg s-gate" fill="#ffffff" stroke="#7a5bd1" stroke-width="1.6"/>
+  <text x="240" y="202" text-anchor="middle" class="f-gate" fill="#7a5bd1" font-size="13.5" font-weight="600">&#963;(w<tspan font-size="9.5" dy="3.5">i</tspan><tspan dy="-3.5">) = &#945;</tspan><tspan font-size="9.5" dy="3.5">i</tspan></text>
+
+  <path d="M162 196 H 112" stroke-dasharray="4 3" class="s-gate" stroke="#7a5bd1" stroke-width="1.3" fill="none" marker-end="url(#h-gate)"/>
+  <path d="M318 196 H 368" stroke-dasharray="4 3" class="s-gate" stroke="#7a5bd1" stroke-width="1.3" fill="none" marker-end="url(#h-gate)"/>
+  <text x="137" y="186" text-anchor="middle" class="f-gate" fill="#7a5bd1" font-size="11" font-weight="600">&#945;<tspan font-size="8.5" dy="2.5">i</tspan></text>
+  <text x="343" y="186" text-anchor="middle" class="f-gate" fill="#7a5bd1" font-size="11" font-weight="600">1&#8722;&#945;<tspan font-size="8.5" dy="2.5">i</tspan></text>
+  <text x="240" y="236" text-anchor="middle" class="f-muted" fill="#6b7180" font-size="10.5">learnable, one per stage</text>
+
+  <path d="M92 211 V 272 H 216" class="s-line" stroke="#c9ccd3" stroke-width="1.6" fill="none" marker-end="url(#h-ar)"/>
+  <path d="M388 211 V 272 H 264" class="s-line" stroke="#c9ccd3" stroke-width="1.6" fill="none" marker-end="url(#h-ar)"/>
+
+  <circle cx="240" cy="272" r="17" class="f-accent" fill="#3355d6"/>
+  <text x="240" y="278" text-anchor="middle" class="f-on-accent" fill="#ffffff" font-size="16" font-weight="600">+</text>
+
+  <path d="M240 289 V 310" class="s-line" stroke="#c9ccd3" stroke-width="1.6" fill="none" marker-end="url(#h-ar)"/>
+  <text x="240" y="326" text-anchor="middle" class="f-muted" fill="#6b7180" font-size="11.5">next stage</text>
+</svg>

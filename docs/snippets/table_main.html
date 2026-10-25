@@ -1,0 +1,16 @@
+<div class="mh-table" markdown="0">
+<table>
+<thead><tr>
+<th>Configuration</th><th class="num">Feature matching ↓</th>
+<th class="num">L1 spectrogram ↓</th><th class="num">FM vs baseline</th>
+</tr></thead>
+<tbody>
+<tr><td class="sys">Baseline HiFi-GAN</td><td class="num">0.0736</td><td class="num">0.2975</td><td class="num">—</td></tr>
+<tr><td class="sys">Mamba only, no MRF</td><td class="num">0.1291</td><td class="num">0.3307</td><td class="num">+75.4% FM</td></tr>
+<tr><td class="sys">Hybrid 2 summation, Mamba-64</td><td class="num">0.0711</td><td class="num">0.2991</td><td class="num">-3.4% FM</td></tr>
+<tr class="mh-row"><td class="sys">Hybrid 1 gated, Mamba-64</td><td class="num best">0.0623</td><td class="num">0.2806</td><td class="num">-15.4% FM</td></tr>
+<tr class="mh-row"><td class="sys">Hybrid 1 gated, Mamba-128</td><td class="num">0.0771</td><td class="num best">0.2587</td><td class="num">+4.8% FM</td></tr>
+</tbody>
+</table>
+<p class="mh-note">One run each, 50 epochs, seed 1234. Lower is better in both loss columns, so a negative change is an improvement. Both are training objectives, not perceptual scores.</p>
+</div>
