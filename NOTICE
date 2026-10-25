@@ -1,0 +1,23 @@
+Mamba HiFi-GAN
+Copyright 2025 Huseyin Karaca, Rabia Ela Unlu, Emre Can Yayla
+
+This product includes software developed as part of SpeechBrain
+(https://github.com/speechbrain/speechbrain), licensed under the Apache License, Version 2.0.
+
+The generators in src/mambahifigan/ are derived from SpeechBrain's HiFi-GAN implementation at commit
+637f0a55 (speechbrain/lobes/models/HifiGAN.py). ResBlock1, ResBlock2 and LRELU_SLOPE are imported from
+SpeechBrain unchanged; OriginalHifiganGenerator is a verbatim copy of SpeechBrain's HifiganGenerator under
+a different name.
+
+overlay/speechbrain/lobes/models/HifiGAN.py is SpeechBrain's file with this project's additions applied, kept
+as the archival record of the code that produced the reported runs.
+
+HiFi-GAN is from Kong, Kim and Bae, "HiFi-GAN: Generative Adversarial Networks for Efficient and High
+Fidelity Speech Synthesis", NeurIPS 2020.
+
+Mamba is from Gu and Dao, "Mamba: Linear-Time Sequence Modeling with Selective State Spaces", 2024. The
+Mamba2 implementation used here is from the mamba-ssm package (https://github.com/state-spaces/mamba),
+Apache-2.0.
+
+The LJSpeech dataset (https://keithito.com/LJ-Speech-Dataset/) is in the public domain. The audio samples
+under docs/assets/audio/ are model outputs and reconstructions derived from it.

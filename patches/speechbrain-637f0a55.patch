@@ -1,0 +1,3993 @@
+--- a/speechbrain/lobes/models/HifiGAN.py
++++ b/speechbrain/lobes/models/HifiGAN.py
+@@ -39,336 +39,3279 @@
+ 
+ import speechbrain as sb
+ from speechbrain.nnet.CNN import Conv1d, Conv2d, ConvTranspose1d
+-
+-LRELU_SLOPE = 0.1
++from torch.nn.utils import weight_norm, remove_weight_norm
++
++# --- 1. YARDIMCI FONKSİYONLAR (Dependency Yok) ---
++def init_weights(m, mean=0.0, std=0.01):
++    """
++    Saf PyTorch katmanları için ağırlık başlatma.
++    SpeechBrain wrapper'ı olmadığı için 'weight' attribute'u kesin vardır.
++    """
++    classname = m.__class__.__name__
++    if classname.find("Conv") != -1:
++        if hasattr(m, "weight") and m.weight is not None:
++            m.weight.data.normal_(mean, std)
++        # Weight norm uygulanmışsa (g ve v parametreleri)
++        if hasattr(m, "weight_g") and m.weight_g is not None:
++            m.weight_g.data.normal_(mean, std)
++        if hasattr(m, "weight_v") and m.weight_v is not None:
++            m.weight_v.data.normal_(mean, std)
++
++def get_padding(kernel_size, dilation=1):
++    return int((kernel_size * dilation - dilation) / 2)
++
++try:
++    from mamba_ssm import Mamba2
++except ImportError:
++    Mamba2 = None
++    print("Warning: mamba_ssm not found. Mamba2 will not be available.")
++
++LRELU_SLOPE = 0.1
++
++
++def dynamic_range_compression(x, C=1, clip_val=1e-5):
++    """Dynamique range compression for audio signals"""
++    return torch.log(torch.clamp(x, min=clip_val) * C)
++
++
++def mel_spectogram(
++    sample_rate,
++    hop_length,
++    win_length,
++    n_fft,
++    n_mels,
++    f_min,
++    f_max,
++    power,
++    normalized,
++    norm,
++    mel_scale,
++    compression,
++    audio,
++):
++    """calculates MelSpectrogram for a raw audio signal
++
++    Arguments
++    ---------
++    sample_rate : int
++        Sample rate of audio signal.
++    hop_length : int
++        Length of hop between STFT windows.
++    win_length : int
++        Window size.
++    n_fft : int
++        Size of FFT.
++    n_mels : int
++        Number of mel filterbanks.
++    f_min : float
++        Minimum frequency.
++    f_max : float
++        Maximum frequency.
++    power : float
++        Exponent for the magnitude spectrogram.
++    normalized : bool
++        Whether to normalize by magnitude after stft.
++    norm : str or None
++        If "slaney", divide the triangular mel weights by the width of the mel band
++    mel_scale : str
++        Scale to use: "htk" or "slaney".
++    compression : bool
++        whether to do dynamic range compression
++    audio : torch.tensor
++        input audio signal
++
++    Returns
++    -------
++    Mel spectrogram
++    """
++
++    audio_to_mel = transforms.MelSpectrogram(
++        sample_rate=sample_rate,
++        hop_length=hop_length,
++        win_length=win_length,
++        n_fft=n_fft,
++        n_mels=n_mels,
++        f_min=f_min,
++        f_max=f_max,
++        power=power,
++        normalized=normalized,
++        norm=norm,
++        mel_scale=mel_scale,
++    ).to(audio.device)
++
++    mel = audio_to_mel(audio)
++
++    if compression:
++        mel = dynamic_range_compression(mel)
++
++    return mel
++
++
++def process_duration(code, code_feat):
++    """
++    Process a given batch of code to extract consecutive unique elements and their associated features.
++
++    Arguments
++    ---------
++    code : torch.Tensor (batch, time)
++        Tensor of code indices.
++    code_feat : torch.Tensor (batch, time, channel)
++        Tensor of code features.
++
++    Returns
++    -------
++    uniq_code_feat_filtered : torch.Tensor (batch, time)
++        Features of consecutive unique codes.
++    mask : torch.Tensor (batch, time)
++        Padding mask for the unique codes.
++    uniq_code_count : torch.Tensor (n)
++        Count of unique codes.
++
++    Example
++    -------
++    >>> code = torch.IntTensor([[40, 18, 18, 10]])
++    >>> code_feat = torch.rand([1, 4, 128])
++    >>> out_tensor, mask, uniq_code = process_duration(code, code_feat)
++    >>> out_tensor.shape
++    torch.Size([1, 1, 128])
++    >>> mask.shape
++    torch.Size([1, 1])
++    >>> uniq_code.shape
++    torch.Size([1])
++    """
++    uniq_code_count = []
++    uniq_code_feat = []
++    for i in range(code.size(0)):
++        _, count = torch.unique_consecutive(code[i, :], return_counts=True)
++        if len(count) > 2:
++            # remove first and last code as segment sampling may cause incomplete segment length
++            uniq_code_count.append(count[1:-1])
++            uniq_code_idx = count.cumsum(dim=0)[:-2]
++        else:
++            uniq_code_count.append(count)
++            uniq_code_idx = count.cumsum(dim=0) - 1
++        uniq_code_feat.append(
++            code_feat[i, uniq_code_idx, :].view(-1, code_feat.size(2))
++        )
++    uniq_code_count = torch.cat(uniq_code_count)
++
++    # collate
++    max_len = max(feat.size(0) for feat in uniq_code_feat)
++    uniq_code_feat_filtered = uniq_code_feat[0].new_zeros(
++        (len(uniq_code_feat), max_len, uniq_code_feat[0].size(1))
++    )
++    mask = torch.arange(max_len).repeat(len(uniq_code_feat), 1)
++    for i, v in enumerate(uniq_code_feat):
++        uniq_code_feat_filtered[i, : v.size(0)] = v
++        mask[i, :] = mask[i, :] < v.size(0)
++
++    return uniq_code_feat_filtered, mask.bool(), uniq_code_count.float()
++
++
++##################################
++# Generator
++##################################
++
++
++class ResBlock1(torch.nn.Module):
++    """
++    Residual Block Type 1, which has 3 convolutional layers in each convolution block.
++
++    Arguments
++    ---------
++    channels : int
++        number of hidden channels for the convolutional layers.
++    kernel_size : int
++        size of the convolution filter in each layer.
++    dilation : list
++        list of dilation value for each conv layer in a block.
++    """
++
++    def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5)):
++        super().__init__()
++        self.convs1 = nn.ModuleList(
++            [
++                Conv1d(
++                    in_channels=channels,
++                    out_channels=channels,
++                    kernel_size=kernel_size,
++                    stride=1,
++                    dilation=dilation[0],
++                    padding="same",
++                    skip_transpose=True,
++                    weight_norm=True,
++                ),
++                Conv1d(
++                    in_channels=channels,
++                    out_channels=channels,
++                    kernel_size=kernel_size,
++                    stride=1,
++                    dilation=dilation[1],
++                    padding="same",
++                    skip_transpose=True,
++                    weight_norm=True,
++                ),
++                Conv1d(
++                    in_channels=channels,
++                    out_channels=channels,
++                    kernel_size=kernel_size,
++                    stride=1,
++                    dilation=dilation[2],
++                    padding="same",
++                    skip_transpose=True,
++                    weight_norm=True,
++                ),
++            ]
++        )
++
++        self.convs2 = nn.ModuleList(
++            [
++                Conv1d(
++                    in_channels=channels,
++                    out_channels=channels,
++                    kernel_size=kernel_size,
++                    stride=1,
++                    dilation=1,
++                    padding="same",
++                    skip_transpose=True,
++                    weight_norm=True,
++                ),
++                Conv1d(
++                    in_channels=channels,
++                    out_channels=channels,
++                    kernel_size=kernel_size,
++                    stride=1,
++                    dilation=1,
++                    padding="same",
++                    skip_transpose=True,
++                    weight_norm=True,
++                ),
++                Conv1d(
++                    in_channels=channels,
++                    out_channels=channels,
++                    kernel_size=kernel_size,
++                    stride=1,
++                    dilation=1,
++                    padding="same",
++                    skip_transpose=True,
++                    weight_norm=True,
++                ),
++            ]
++        )
++
++    def forward(self, x):
++        """Returns the output of ResBlock1
++
++        Arguments
++        ---------
++        x : torch.Tensor (batch, channel, time)
++            input tensor.
++
++        Returns
++        -------
++        The ResBlock outputs
++        """
++
++        for c1, c2 in zip(self.convs1, self.convs2):
++            xt = F.leaky_relu(x, LRELU_SLOPE)
++            xt = c1(xt)
++            xt = F.leaky_relu(xt, LRELU_SLOPE)
++            xt = c2(xt)
++            x = xt + x
++        return x
++
++    def remove_weight_norm(self):
++        """This functions removes weight normalization during inference."""
++        for layer in self.convs1:
++            layer.remove_weight_norm()
++        for layer in self.convs2:
++            layer.remove_weight_norm()
++
++
++class ResBlock2(torch.nn.Module):
++    """
++    Residual Block Type 2, which has 2 convolutional layers in each convolution block.
++
++    Arguments
++    ---------
++    channels : int
++        number of hidden channels for the convolutional layers.
++    kernel_size : int
++        size of the convolution filter in each layer.
++    dilation : list
++        list of dilation value for each conv layer in a block.
++    """
++
++    def __init__(self, channels, kernel_size=3, dilation=(1, 3)):
++        super().__init__()
++        self.convs = nn.ModuleList(
++            [
++                Conv1d(
++                    in_channels=channels,
++                    out_channels=channels,
++                    kernel_size=kernel_size,
++                    stride=1,
++                    dilation=dilation[0],
++                    padding="same",
++                    skip_transpose=True,
++                    weight_norm=True,
++                ),
++                Conv1d(
++                    in_channels=channels,
++                    out_channels=channels,
++                    kernel_size=kernel_size,
++                    stride=1,
++                    dilation=dilation[1],
++                    padding="same",
++                    skip_transpose=True,
++                    weight_norm=True,
++                ),
++            ]
++        )
++
++    def forward(self, x):
++        """Returns the output of ResBlock1
++
++        Arguments
++        ---------
++        x : torch.Tensor (batch, channel, time)
++            input tensor.
++
++        Returns
++        -------
++        The ResBlock outputs
++        """
++
++        for c in self.convs:
++            xt = F.leaky_relu(x, LRELU_SLOPE)
++            xt = c(xt)
++            x = xt + x
++        return x
++
++    def remove_weight_norm(self):
++        """This functions removes weight normalization during inference."""
++        for layer in self.convs:
++            layer.remove_weight_norm()
++
++
++class BiMamba2Block(nn.Module):
++    """Bidirectional Mamba2 Block"""
++
++    def __init__(self, channels, d_state=64, d_conv=4, expand=2):
++        super().__init__()
++        if Mamba2 is None:
++            raise ImportError("mamba_ssm is not installed.")
++        self.forward_mamba = Mamba2(
++            d_model=channels,
++            d_state=d_state,
++            d_conv=d_conv,
++            expand=expand,
++        )
++        self.backward_mamba = Mamba2(
++            d_model=channels,
++            d_state=d_state,
++            d_conv=d_conv,
++            expand=expand,
++        )
++        self.norm = nn.LayerNorm(channels)
++
++    def forward(self, x):
++        # x: [Batch, Channel, Time]
++        x_t = x.transpose(1, 2)  # [Batch, Time, Channel]
++
++        out_fwd = self.forward_mamba(x_t)
++        out_bwd = self.backward_mamba(x_t.flip(1)).flip(1)
++
++        out = out_fwd + out_bwd
++        out = self.norm(out)
++
++        return out.transpose(1, 2)  # [Batch, Channel, Time]
++
++    def remove_weight_norm(self):
++        # HiFi-GAN inference sırasında hata vermemesi için boş fonksiyon
++        pass
++
++class SpectrogramRefiner(nn.Module):
++    """
++    FIXED Spectrogram Refiner.
++    
++    Problem Solved: 
++    - Mel-Spec input is 80 channels.
++    - Mamba with expand=2 creates internal dim 160.
++    - 160 is not divisible by headdim=64 (AssertionError).
++    
++    Solution:
++    - We project Input(80) -> SafeDim(64) before Mamba.
++    - Mamba runs smoothly on 64 dims.
++    - We project SafeDim(64) -> Output(80) to get the residual.
++    """
++    def __init__(self, channels=80, d_state=64, layers=2):
++        super().__init__()
++        if Mamba2 is None: raise ImportError("mamba_ssm required")
++        
++        # Mamba için Güvenli Boyut (64 her şeye bölünür ve GPU dostudur)
++        self.safe_dim = 64
++        
++        # 1. Input Projection (80 -> 64)
++        self.in_proj = weight_norm(nn.Conv1d(channels, self.safe_dim, 1))
++        
++        # 2. Mamba Layers (Running on 64 channels)
++        self.layers = nn.ModuleList()
++        for _ in range(layers):
++            self.layers.append(
++                Mamba2(
++                    d_model=self.safe_dim, # Artık 64, sorunsuz.
++                    d_state=d_state, 
++                    d_conv=4, 
++                    expand=2, 
++                    headdim=64 # 64 * 2 = 128, 128 % 64 == 0. (Hata Yok)
++                )
++            )
++            self.layers.append(nn.LayerNorm(self.safe_dim))
++
++        # 3. Output Projection (64 -> 80) - Zero Init
++        self.out_proj = weight_norm(nn.Conv1d(self.safe_dim, channels, 1))
++        
++        # Zero-Init: Başlangıçta girdiye '0' ekler, baseline ile aynı başlar.
++        self.out_proj.weight.data.fill_(0.0)
++        self.out_proj.bias.data.fill_(0.0)
++
++    def forward(self, x):
++        # x: [Batch, 80, T]
++        residual_in = x
++        
++        # Project to Safe Dim
++        x_safe = self.in_proj(x) # [B, 64, T]
++        
++        # Mamba Process
++        x_t = x_safe.transpose(1, 2) # [B, T, 64]
++        
++        for layer in self.layers:
++            if isinstance(layer, Mamba2):
++                # Bidirectional trick
++                x_fwd = layer(x_t)
++                x_bwd = layer(x_t.flip(1)).flip(1)
++                x_t = x_fwd + x_bwd
++            else:
++                x_t = layer(x_t) # Norm
++        
++        x_back = x_t.transpose(1, 2) # [B, 64, T]
++        
++        # Project Back to Original Dim (Calculate Correction)
++        delta = self.out_proj(x_back) # [B, 80, T]
++        
++        # Add Correction to Original Input
++        return residual_in + delta
++    
++    def remove_weight_norm(self):
++        remove_weight_norm(self.in_proj)
++        remove_weight_norm(self.out_proj)
++
++
++class HifiganGeneratorSpecRefine(torch.nn.Module):
++    """
++    HiFi-GAN with Input Refinement.
++    
++    Novelty:
++    Instead of putting Mamba INSIDE the generator (where it fights with Conv),
++    we put Mamba BEFORE the generator. 
++    It 'fixes' the Mel-Spectrogram using global context.
++    
++    Architecture:
++    Input -> [Mamba Refiner] -> Refined_Input -> [Standard HiFi-GAN] -> Audio
++    """
++
++    def __init__(
++        self,
++        in_channels, 
++        out_channels,
++        resblock_type,
++        resblock_dilation_sizes,
++        resblock_kernel_sizes,
++        upsample_kernel_sizes,
++        upsample_initial_channel,
++        upsample_factors,
++        inference_padding=5,
++        cond_channels=0,
++        conv_post_bias=True,
++    ):
++        super().__init__()
++        
++        # --- KANAL KİLİDİ: 80 ---
++        in_channels = 80 
++        # ----------------------
++
++        self.inference_padding = inference_padding
++        self.num_kernels = len(resblock_kernel_sizes)
++        self.num_upsamples = len(upsample_factors)
++        
++        # --- PART 1: MAMBA REFINER (YENİLİK BURADA) ---
++        # Girişteki 80 kanalı işler. HiFi-GAN'a girmeden önce veriyi zenginleştirir.
++        self.input_refiner = SpectrogramRefiner(channels=in_channels, d_state=64, layers=2)
++        # ----------------------------------------------
++
++        # --- PART 2: STANDARD HiFi-GAN (DOKUNULMAMIŞ) ---
++        resblock = ResBlock1 if resblock_type == "1" else ResBlock2
++
++        self.conv_pre = weight_norm(nn.Conv1d(
++            in_channels=in_channels,
++            out_channels=upsample_initial_channel,
++            kernel_size=7,
++            stride=1,
++            padding=3
++        ))
++        
++        self.ups = nn.ModuleList()
++        self.resblocks = nn.ModuleList()
++
++        for i, (u, k) in enumerate(zip(upsample_factors, upsample_kernel_sizes)):
++            self.ups.append(weight_norm(
++                nn.ConvTranspose1d(
++                    in_channels=upsample_initial_channel // (2**i),
++                    out_channels=upsample_initial_channel // (2**(i+1)),
++                    kernel_size=k,
++                    stride=u,
++                    padding=(k-u)//2
++                )
++            ))
++            
++            ch = upsample_initial_channel // (2**(i+1))
++            
++            for j, (k_res, d_res) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
++                self.resblocks.append(resblock(ch, k_res, d_res))
++
++        self.conv_post = weight_norm(nn.Conv1d(
++            in_channels=ch, 
++            out_channels=1, 
++            kernel_size=7, 
++            stride=1, 
++            padding=3,
++            bias=conv_post_bias
++        ))
++        
++        if cond_channels > 0:
++            self.cond_layer = weight_norm(nn.Conv1d(cond_channels, upsample_initial_channel, 1))
++
++        self.apply(init_weights)
++
++    def forward(self, x, g=None):
++        # x: [Batch, 80, Time]
++        
++        # --- ADIM 1: REFINEMENT ---
++        # Spektrogramı Mamba ile düzelt
++        x = self.input_refiner(x)
++        # --------------------------
++        
++        # --- ADIM 2: STANDARD GENERATION ---
++        o = self.conv_pre(x)
++        if hasattr(self, "cond_layer"):
++            o = o + self.cond_layer(g)
++
++        for i in range(self.num_upsamples):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            o = self.ups[i](o)
++            
++            z_sum = None
++            for j in range(self.num_kernels):
++                if z_sum is None:
++                    z_sum = self.resblocks[i*self.num_kernels+j](o)
++                else:
++                    z_sum += self.resblocks[i*self.num_kernels+j](o)
++            o = z_sum / self.num_kernels
++            
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        o = torch.tanh(o)
++        return o
++
++    def remove_weight_norm(self):
++        print('Removing weight norm...')
++        remove_weight_norm(self.conv_pre)
++        for l in self.ups: remove_weight_norm(l)
++        for l in self.resblocks: l.remove_weight_norm()
++        remove_weight_norm(self.conv_post)
++        if hasattr(self, "cond_layer"): remove_weight_norm(self.cond_layer)
++        
++        # Refiner temizliği
++        self.input_refiner.remove_weight_norm()
++
++    @torch.no_grad()
++    def inference(self, c, padding=True):
++        if padding:
++            c = torch.nn.functional.pad(c, (self.inference_padding, self.inference_padding), "replicate")
++        return self.forward(c)
++
++
++
++
++class SafeMambaBlock(nn.Module):
++    """
++    Memory-Safe Mamba Block.
++    Projects input to 64 dims to fit in Shared Memory and avoid errors.
++    """
++    def __init__(self, channels, d_state=64):
++        super().__init__()
++        if Mamba2 is None: raise ImportError("mamba_ssm required")
++        
++        self.mamba_dim = 64 # Güvenli boyut
++        
++        # Projection: Input Channel -> 64
++        self.input_proj = weight_norm(nn.Conv1d(channels, self.mamba_dim, 1))
++        
++        self.mamba = Mamba2(
++            d_model=self.mamba_dim, 
++            d_state=d_state, 
++            d_conv=4, 
++            expand=1, 
++            headdim=64 
++        )
++        self.norm = nn.LayerNorm(self.mamba_dim)
++        
++        # Projection: 64 -> Input Channel
++        self.output_proj = weight_norm(nn.Conv1d(self.mamba_dim, channels, 1))
++
++    def forward(self, x):
++        # x: [B, C, T]
++        residual = x
++        x = self.input_proj(x)
++        x_t = x.transpose(1, 2)
++        x_out = self.mamba(x_t)
++        x_out = self.norm(x_out).transpose(1, 2)
++        x_out = self.output_proj(x_out)
++        return residual + x_out # Residual connection
++        
++    def remove_weight_norm(self): 
++        remove_weight_norm(self.input_proj)
++        remove_weight_norm(self.output_proj)
++
++class MambaSideNetwork(nn.Module):
++    """
++    A lightweight, Mamba-based generator that runs in parallel.
++    It produces a 'Correction Waveform'.
++    """
++    def __init__(self, in_channels, upsample_factors, upsample_initial_channel):
++        super().__init__()
++        
++        # Giriş Katmanı
++        self.conv_pre = weight_norm(nn.Conv1d(in_channels, upsample_initial_channel, 7, 1, padding=3))
++        
++        self.ups = nn.ModuleList()
++        self.mambas = nn.ModuleList()
++        
++        # Basitleştirilmiş Upsample + Mamba yapısı (Conv MRF yok, sadece Mamba)
++        for i, u in enumerate(upsample_factors):
++            self.ups.append(weight_norm(
++                nn.ConvTranspose1d(
++                    upsample_initial_channel // (2**i),
++                    upsample_initial_channel // (2**(i+1)),
++                    kernel_size=u*2, # Basit kernel
++                    stride=u,
++                    padding=u // 2
++                )
++            ))
++            
++            ch = upsample_initial_channel // (2**(i+1))
++            # Her adımda yapıyı korumak için Mamba
++            self.mambas.append(SafeMambaBlock(channels=ch, d_state=32)) # Hafif Mamba
++            
++        # Çıkış Katmanı (Waveform üretir)
++        self.conv_post = weight_norm(nn.Conv1d(ch, 1, 7, 1, padding=3))
++        
++        # --- ZERO INITIALIZATION (SİHİR BURADA) ---
++        # Bu katmanın ağırlıklarını 0 yapıyoruz.
++        # Böylece eğitimin başında bu ağ "0" (sessizlik) üretir.
++        # Model, Baseline HiFi-GAN ile aynı performansta başlar.
++        self.conv_post.weight.data.fill_(0.0)
++        self.conv_post.bias.data.fill_(0.0)
++
++    def forward(self, x):
++        o = self.conv_pre(x)
++        for i in range(len(self.ups)):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            o = self.ups[i](o)
++            o = self.mambas[i](o)
++        
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        return torch.tanh(o)
++        
++    def remove_weight_norm(self):
++        remove_weight_norm(self.conv_pre)
++        for l in self.ups: remove_weight_norm(l)
++        for l in self.mambas: l.remove_weight_norm()
++        remove_weight_norm(self.conv_post)
++
++# --- HEDEF CLASS: DUAL-PATH GENERATOR ---
++
++class HifiganGeneratorDualPath(torch.nn.Module):
++    """
++    HiFi-GAN Dual-Path Generator.
++    
++    Path 1 (Main): Standard HiFi-GAN (Conv). Handles Texture perfectly.
++    Path 2 (Side): Mamba Network. Handles Structure/Correction.
++    
++    Fusion: y_final = y_conv + y_mamba
++    
++    Safety: Path 2 is Zero-Initialized. Training starts exactly at Baseline performance
++    and improves from there. No risk of degradation.
++    """
++
++    def __init__(
++        self,
++        in_channels, 
++        out_channels,
++        resblock_type,
++        resblock_dilation_sizes,
++        resblock_kernel_sizes,
++        upsample_kernel_sizes,
++        upsample_initial_channel,
++        upsample_factors,
++        inference_padding=5,
++        cond_channels=0,
++        conv_post_bias=True,
++    ):
++        super().__init__()
++        
++        # --- KANAL KİLİDİ: 80 ---
++        in_channels = 80 
++        # ----------------------
++
++        self.inference_padding = inference_padding
++        self.num_kernels = len(resblock_kernel_sizes)
++        self.num_upsamples = len(upsample_factors)
++        
++        resblock = ResBlock1 if resblock_type == "1" else ResBlock2
++
++        # --- PATH 1: STANDARD HiFi-GAN (DOKUNULMAMIŞ) ---
++        self.conv_pre = weight_norm(nn.Conv1d(in_channels, upsample_initial_channel, 7, 1, padding=3))
++        
++        self.ups = nn.ModuleList()
++        self.resblocks = nn.ModuleList()
++
++        for i, (u, k) in enumerate(zip(upsample_factors, upsample_kernel_sizes)):
++            self.ups.append(weight_norm(
++                nn.ConvTranspose1d(
++                    upsample_initial_channel // (2**i),
++                    upsample_initial_channel // (2**(i+1)),
++                    kernel_size=k,
++                    stride=u,
++                    padding=(k-u)//2
++                )
++            ))
++            ch = upsample_initial_channel // (2**(i+1))
++            for j, (k_res, d_res) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
++                self.resblocks.append(resblock(ch, k_res, d_res))
++
++        self.conv_post = weight_norm(nn.Conv1d(ch, 1, 7, 1, padding=3, bias=conv_post_bias))
++        
++        if cond_channels > 0:
++            self.cond_layer = weight_norm(nn.Conv1d(cond_channels, upsample_initial_channel, 1))
++            
++        # --- PATH 2: MAMBA SIDE NETWORK (CO-PILOT) ---
++        # Sadece Mamba'dan oluşan paralel bir ağ.
++        # HiFi-GAN ile aynı upsample oranlarını kullanır.
++        self.mamba_side_net = MambaSideNetwork(
++            in_channels=in_channels,
++            upsample_factors=upsample_factors,
++            upsample_initial_channel=upsample_initial_channel // 2 # Daha hafif olsun diye yarı kanal
++        )
++        # ---------------------------------------------
++
++        self.apply(init_weights)
++
++    def forward(self, x, g=None):
++        # --- PATH 1: CONV (TEXTURE) ---
++        o = self.conv_pre(x)
++        if hasattr(self, "cond_layer"):
++            o = o + self.cond_layer(g)
++
++        for i in range(self.num_upsamples):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            o = self.ups[i](o)
++            z_sum = None
++            for j in range(self.num_kernels):
++                res_out = self.resblocks[i*self.num_kernels+j](o)
++                if z_sum is None: z_sum = res_out
++                else: z_sum += res_out
++            o = z_sum / self.num_kernels
++            
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        audio_conv = torch.tanh(o) # Orijinal HiFi-GAN çıktısı
++        
++        # --- PATH 2: MAMBA (CORRECTION) ---
++        # Mamba ağından bağımsız bir düzeltme sinyali alıyoruz
++        audio_correction = self.mamba_side_net(x)
++        
++        # --- FUSION ---
++        # İki sinyali topluyoruz. 
++        # Başlangıçta audio_correction = 0 olduğu için eğitim Baseline kalitesinde başlar.
++        # Zamanla Mamba "yardım etmeyi" öğrenir.
++        final_audio = audio_conv + audio_correction
++        
++        # Değerlerin -1, 1 aralığında kalmasını sağla (Safety clamp)
++        return torch.clamp(final_audio, -1.0, 1.0)
++
++    def remove_weight_norm(self):
++        print('Removing weight norm...')
++        remove_weight_norm(self.conv_pre)
++        for l in self.ups: remove_weight_norm(l)
++        for l in self.resblocks: l.remove_weight_norm()
++        remove_weight_norm(self.conv_post)
++        if hasattr(self, "cond_layer"): remove_weight_norm(self.cond_layer)
++        
++        # Yan ağın normlarını da kaldır
++        self.mamba_side_net.remove_weight_norm()
++
++    @torch.no_grad()
++    def inference(self, c, padding=True):
++        if padding:
++            c = torch.nn.functional.pad(c, (self.inference_padding, self.inference_padding), "replicate")
++        return self.forward(c)
++
++
++
++
++
++# --- HEDEF CLASS: SEQUENTIAL PROGRESSIVE ---
++
++class HifiganGeneratorSequentialProgressive(torch.nn.Module):
++    """
++    HiFi-GAN with Sequential Progressive Mamba.
++    
++    Logic:
++    Instead of running Mamba and Conv in parallel (fighting), we run them in SERIES.
++    Upsample -> Mamba (Fix Structure) -> MRF (Generate Texture).
++    
++    Constraints:
++    - We only apply Mamba in the first 'mamba_layers' (Low Res).
++    - High Res layers are pure Conv to preserve texture fidelity.
++    """
++
++    def __init__(
++        self,
++        in_channels, 
++        out_channels,
++        resblock_type,
++        resblock_dilation_sizes,
++        resblock_kernel_sizes,
++        upsample_kernel_sizes,
++        upsample_initial_channel,
++        upsample_factors,
++        inference_padding=5,
++        cond_channels=0,
++        conv_post_bias=True,
++    ):
++        super().__init__()
++        
++        # --- KANAL KİLİDİ: 80 ---
++        in_channels = 80 
++        # ----------------------
++
++        self.inference_padding = inference_padding
++        self.num_kernels = len(resblock_kernel_sizes)
++        self.num_upsamples = len(upsample_factors)
++        
++        # STRATEJİ: Mamba kaç katmanda çalışsın?
++        # Toplam katmanların yarısı kadar (Örn: 4 ise ilk 2'sinde)
++        self.mamba_active_layers = self.num_upsamples // 2
++        
++        resblock = ResBlock1 if resblock_type == "1" else ResBlock2
++
++        # 1. Initial Conv
++        self.conv_pre = weight_norm(nn.Conv1d(
++            in_channels=in_channels,
++            out_channels=upsample_initial_channel,
++            kernel_size=7,
++            stride=1,
++            padding=3
++        ))
++        
++        # 2. Layers
++        self.ups = nn.ModuleList()
++        self.mambas = nn.ModuleList() 
++        self.resblocks = nn.ModuleList()
++
++        for i, (u, k) in enumerate(zip(upsample_factors, upsample_kernel_sizes)):
++            # A. Upsample
++            self.ups.append(weight_norm(
++                nn.ConvTranspose1d(
++                    in_channels=upsample_initial_channel // (2**i),
++                    out_channels=upsample_initial_channel // (2**(i+1)),
++                    kernel_size=k,
++                    stride=u,
++                    padding=(k-u)//2
++                )
++            ))
++            
++            ch = upsample_initial_channel // (2**(i+1))
++            
++            # B. Mamba Block (Sadece ilk katmanlar için oluşturuyoruz)
++            if i < self.mamba_active_layers:
++                self.mambas.append(SafeMambaBlock(channels=ch, d_state=64))
++            else:
++                self.mambas.append(None) # Boş tutucu
++            
++            # C. MRF Blocks (Conv)
++            for j, (k_res, d_res) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
++                self.resblocks.append(resblock(ch, k_res, d_res))
++
++        # 3. Post Conv
++        self.conv_post = weight_norm(nn.Conv1d(
++            in_channels=ch, 
++            out_channels=1, 
++            kernel_size=7, 
++            stride=1, 
++            padding=3,
++            bias=conv_post_bias
++        ))
++        
++        if cond_channels > 0:
++            self.cond_layer = weight_norm(nn.Conv1d(cond_channels, upsample_initial_channel, 1))
++
++        self.apply(init_weights)
++
++    def forward(self, x, g=None):
++        o = self.conv_pre(x)
++        if hasattr(self, "cond_layer"):
++            o = o + self.cond_layer(g)
++
++        for i in range(self.num_upsamples):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            
++            # 1. Upsample (Büyüt)
++            o = self.ups[i](o) 
++            
++            # --- SEQUENTIAL MAMBA (SIRALI) ---
++            # Eğer bu katmanda Mamba aktifse:
++            if self.mambas[i] is not None:
++                # ÖNCE Mamba çalışır ve yapıyı düzeltir
++                o = self.mambas[i](o)
++            # ---------------------------------
++            
++            # 2. MRF (Conv)
++            # Mamba'nın hazırladığı/düzelttiği sinyali alıp dokusunu işler
++            z_sum = None
++            for j in range(self.num_kernels):
++                res_out = self.resblocks[i*self.num_kernels+j](o)
++                if z_sum is None:
++                    z_sum = res_out
++                else:
++                    z_sum += res_out
++            
++            # MRF ortalaması o anki output olur
++            o = z_sum / self.num_kernels
++            
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        o = torch.tanh(o)
++        return o
++
++    def remove_weight_norm(self):
++        print('Removing weight norm...')
++        remove_weight_norm(self.conv_pre)
++        for l in self.ups: remove_weight_norm(l)
++        for l in self.resblocks: l.remove_weight_norm()
++        for l in self.mambas: 
++            if l is not None: l.remove_weight_norm()
++            
++        remove_weight_norm(self.conv_post)
++        if hasattr(self, "cond_layer"): remove_weight_norm(self.cond_layer)
++
++    @torch.no_grad()
++    def inference(self, c, padding=True):
++        if padding:
++            c = torch.nn.functional.pad(c, (self.inference_padding, self.inference_padding), "replicate")
++        return self.forward(c)
++
++
++
++class LowResMambaBlock(nn.Module):
++    """
++    Robust Multi-Rate Mamba Block.
++    
++    FIX: 
++    - Input channels are projected to a fixed 'mamba_dim' (64).
++    - This guarantees 'headdim=64' which fits in ANY GPU Shared Memory.
++    - Solves both 'AssertionError' and 'Out of Resources' errors.
++    """
++    def __init__(self, channels, d_state=64, scale_factor=2):
++        super().__init__()
++        if Mamba2 is None: raise ImportError("mamba_ssm required")
++        
++        self.scale_factor = scale_factor
++        
++        # 1. Downsample (Pooling)
++        self.pool = nn.AvgPool1d(kernel_size=scale_factor, stride=scale_factor)
++        
++        # --- FIXED PROJECTION ---
++        # Mamba'nın içinde çalışacağı güvenli boyut (64 her GPU'ya sığar)
++        self.mamba_dim = 64 
++        
++        # Giriş Kanalı -> Güvenli Mamba Boyutu (64)
++        self.input_proj = weight_norm(nn.Conv1d(channels, self.mamba_dim, 1))
++        
++        # 2. Mamba Core
++        # Artık headdim=64 sabit, d_model=64 sabit. Hata verme şansı yok.
++        self.mamba = Mamba2(
++            d_model=self.mamba_dim, 
++            d_state=d_state, 
++            d_conv=4, 
++            expand=1, 
++            headdim=64 
++        )
++        self.norm = nn.LayerNorm(self.mamba_dim)
++        
++        # 3. Output Projection (Geri Dönüş)
++        # Güvenli Mamba Boyutu (64) -> Orijinal Kanal Sayısı
++        self.output_proj = weight_norm(nn.Conv1d(self.mamba_dim, channels, 1))
++
++    def forward(self, x):
++        # x: [Batch, Channel, Time]
++        residual = x
++        
++        # A. Downsample (Low Freq)
++        x_low = self.pool(x)
++        
++        # B. Project to Safe Dim (Channel -> 64)
++        x_low = self.input_proj(x_low)
++        
++        # C. Mamba Process
++        # [B, 64, T_low] -> [B, T_low, 64]
++        x_low_t = x_low.transpose(1, 2)
++        x_out = self.mamba(x_low_t)
++        x_out = self.norm(x_out).transpose(1, 2)
++        
++        # D. Project Back (64 -> Channel)
++        x_out = self.output_proj(x_out)
++        
++        # E. Upsample
++        x_up = F.interpolate(x_out, size=x.shape[2], mode='linear', align_corners=False)
++        
++        # F. Residual Add
++        return residual + x_up
++        
++    def remove_weight_norm(self): 
++        remove_weight_norm(self.input_proj)
++        remove_weight_norm(self.output_proj)
++
++# --- HEDEF CLASS: MULTI-RATE HYBRID ---
++
++class HifiganGeneratorMultiRate(torch.nn.Module):
++    """
++    HiFiGAN with Multi-Rate Mamba (Low-Pass Guidance).
++    Includes Memory-Safe Projections.
++    """
++
++    def __init__(
++        self,
++        in_channels, 
++        out_channels,
++        resblock_type,
++        resblock_dilation_sizes,
++        resblock_kernel_sizes,
++        upsample_kernel_sizes,
++        upsample_initial_channel,
++        upsample_factors,
++        inference_padding=5,
++        cond_channels=0,
++        conv_post_bias=True,
++    ):
++        super().__init__()
++        
++        # --- KANAL KİLİDİ ---
++        in_channels = 80 
++        # --------------------
++
++        self.inference_padding = inference_padding
++        self.num_kernels = len(resblock_kernel_sizes)
++        self.num_upsamples = len(upsample_factors)
++        
++        resblock = ResBlock1 if resblock_type == "1" else ResBlock2
++
++        # 1. Initial Conv
++        self.conv_pre = weight_norm(nn.Conv1d(
++            in_channels=in_channels,
++            out_channels=upsample_initial_channel,
++            kernel_size=7,
++            stride=1,
++            padding=3
++        ))
++        
++        # 2. Layers
++        self.ups = nn.ModuleList()
++        self.resblocks = nn.ModuleList()
++        self.mamba_blocks = nn.ModuleList() 
++
++        for i, (u, k) in enumerate(zip(upsample_factors, upsample_kernel_sizes)):
++            # Upsample
++            self.ups.append(weight_norm(
++                nn.ConvTranspose1d(
++                    in_channels=upsample_initial_channel // (2**i),
++                    out_channels=upsample_initial_channel // (2**(i+1)),
++                    kernel_size=k,
++                    stride=u,
++                    padding=(k-u)//2
++                )
++            ))
++            
++            current_ch = upsample_initial_channel // (2**(i+1))
++            
++            # MRF (Conv - Texture)
++            for j, (k_res, d_res) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
++                self.resblocks.append(resblock(current_ch, k_res, d_res))
++            
++            # --- MULTI-RATE MAMBA (Structure) ---
++            # scale_factor=2 ile sinyali yarı boyutta işler (Detayları görmez/bozmaz)
++            self.mamba_blocks.append(LowResMambaBlock(channels=current_ch, scale_factor=2))
++
++        # 3. Post Conv
++        self.conv_post = weight_norm(nn.Conv1d(
++            in_channels=current_ch, 
++            out_channels=1, 
++            kernel_size=7, 
++            stride=1, 
++            padding=3,
++            bias=conv_post_bias
++        ))
++        
++        if cond_channels > 0:
++            self.cond_layer = weight_norm(nn.Conv1d(cond_channels, upsample_initial_channel, 1))
++
++        self.apply(init_weights)
++
++    def forward(self, x, g=None):
++        o = self.conv_pre(x)
++        if hasattr(self, "cond_layer"):
++            o = o + self.cond_layer(g)
++
++        for i in range(self.num_upsamples):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            o = self.ups[i](o) # Upsample
++            
++            # 1. MRF İşlemi (Conv)
++            z_sum = None
++            for j in range(self.num_kernels):
++                if z_sum is None:
++                    z_sum = self.resblocks[i*self.num_kernels+j](o)
++                else:
++                    z_sum += self.resblocks[i*self.num_kernels+j](o)
++            
++            o = z_sum / self.num_kernels
++            
++            # 2. Mamba Correction
++            # Low-Res ve Projeksiyonlu (Güvenli) Mamba
++            o = self.mamba_blocks[i](o)
++            
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        o = torch.tanh(o)
++        return o
++
++    def remove_weight_norm(self):
++        print('Removing weight norm...')
++        remove_weight_norm(self.conv_pre)
++        for l in self.ups: remove_weight_norm(l)
++        for l in self.resblocks: l.remove_weight_norm()
++        for l in self.mamba_blocks: l.remove_weight_norm()
++            
++        remove_weight_norm(self.conv_post)
++        if hasattr(self, "cond_layer"): remove_weight_norm(self.cond_layer)
++
++    @torch.no_grad()
++    def inference(self, c, padding=True):
++        if padding:
++            c = torch.nn.functional.pad(c, (self.inference_padding, self.inference_padding), "replicate")
++        return self.forward(c)
++
++
++
++
++
++
++
++
++class MambaRefiner(nn.Module):
++    """
++    A standalone Mamba module that takes Raw Audio and refines it.
++    Input: [Batch, 1, Time]
++    Output: [Batch, 1, Time] (Residual Correction)
++    """
++    def __init__(self, d_model=64):
++        super().__init__()
++        if Mamba2 is None: raise ImportError("mamba_ssm required")
++        
++        # 1. Projection: Audio (1 kanal) -> Feature (d_model)
++        self.input_proj = weight_norm(nn.Conv1d(1, d_model, kernel_size=7, padding=3))
++        
++        # 2. Deep Mamba Layers (Global Context Cleaning)
++        # Sinyal çok uzun olduğu için d_state küçük tutulmalı (16 veya 32)
++        self.mamba1 = Mamba2(d_model=d_model, d_state=32, d_conv=4, expand=2)
++        self.norm1 = nn.LayerNorm(d_model)
++        
++        self.mamba2 = Mamba2(d_model=d_model, d_state=32, d_conv=4, expand=2)
++        self.norm2 = nn.LayerNorm(d_model)
++        
++        # 3. Output Projection: Feature -> Audio Correction (1 kanal)
++        self.output_proj = weight_norm(nn.Conv1d(d_model, 1, kernel_size=7, padding=3))
++        
++        # Zero Init (Model eğitime "etkisiz" başlasın diye)
++        self.output_proj.weight.data.fill_(0.0)
++        self.output_proj.bias.data.fill_(0.0)
++
++    def forward(self, x):
++        # x: [Batch, 1, Time]
++        residual = x
++        
++        # Feature Extraction
++        x_feat = self.input_proj(x) # [B, C, T]
++        
++        # Mamba Processing
++        x_t = x_feat.transpose(1, 2) # [B, T, C]
++        
++        x_t = self.mamba1(x_t)
++        x_t = self.norm1(x_t)
++        x_t = F.leaky_relu(x_t, LRELU_SLOPE)
++        
++        x_t = self.mamba2(x_t)
++        x_t = self.norm2(x_t)
++        x_t = F.leaky_relu(x_t, LRELU_SLOPE)
++        
++        x_back = x_t.transpose(1, 2) # [B, C, T]
++        
++        # Correction Signal
++        correction = self.output_proj(x_back)
++        
++        # Add Correction to Original Audio
++        return residual + correction
++
++    def remove_weight_norm(self):
++        remove_weight_norm(self.input_proj)
++        remove_weight_norm(self.output_proj)
++
++# --- HEDEF CLASS: POST-NET ARCHITECTURE ---
++
++class HifiganGeneratorWithPostNet(torch.nn.Module):
++    """
++    HiFiGAN with Mamba Post-Net Refiner.
++    
++    Architecture:
++    1. Generator: Standard HiFi-GAN (No Mamba inside). Produces raw audio.
++    2. Refiner: A separate Mamba network that takes the raw audio and 'polishes' it.
++    
++    Benefit:
++    - Generator focuses on Texture (FM Loss).
++    - Refiner focuses on Structure/Consistency (L1 Loss).
++    - Decoupled optimization prevents them from ruining each other's work.
++    """
++
++    def __init__(
++        self,
++        in_channels, 
++        out_channels,
++        resblock_type,
++        resblock_dilation_sizes,
++        resblock_kernel_sizes,
++        upsample_kernel_sizes,
++        upsample_initial_channel,
++        upsample_factors,
++        inference_padding=5,
++        cond_channels=0,
++        conv_post_bias=True,
++    ):
++        super().__init__()
++        
++        # --- KANAL KİLİDİ ---
++        in_channels = 80 
++        # --------------------
++
++        self.inference_padding = inference_padding
++        self.num_kernels = len(resblock_kernel_sizes)
++        self.num_upsamples = len(upsample_factors)
++        
++        resblock = ResBlock1 if resblock_type == "1" else ResBlock2
++
++        # --- PART 1: STANDARD HiFi-GAN GENERATOR ---
++        self.conv_pre = weight_norm(nn.Conv1d(
++            in_channels=in_channels,
++            out_channels=upsample_initial_channel,
++            kernel_size=7,
++            stride=1,
++            padding=3
++        ))
++        
++        self.ups = nn.ModuleList()
++        self.resblocks = nn.ModuleList()
++
++        for i, (u, k) in enumerate(zip(upsample_factors, upsample_kernel_sizes)):
++            self.ups.append(weight_norm(
++                nn.ConvTranspose1d(
++                    in_channels=upsample_initial_channel // (2**i),
++                    out_channels=upsample_initial_channel // (2**(i+1)),
++                    kernel_size=k,
++                    stride=u,
++                    padding=(k-u)//2
++                )
++            ))
++            
++            ch = upsample_initial_channel // (2**(i+1))
++            
++            for j, (k_res, d_res) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
++                self.resblocks.append(resblock(ch, k_res, d_res))
++
++        self.conv_post = weight_norm(nn.Conv1d(
++            in_channels=ch, 
++            out_channels=1, 
++            kernel_size=7, 
++            stride=1, 
++            padding=3,
++            bias=conv_post_bias
++        ))
++        
++        if cond_channels > 0:
++            self.cond_layer = weight_norm(nn.Conv1d(cond_channels, upsample_initial_channel, 1))
++
++        # --- PART 2: MAMBA POST-NET REFINER ---
++        self.refiner = MambaRefiner(d_model=64)
++        # --------------------------------------
++
++        self.apply(init_weights)
++
++    def forward(self, x, g=None):
++        # 1. Generate Coarse Audio (HiFi-GAN)
++        o = self.conv_pre(x)
++        if hasattr(self, "cond_layer"):
++            o = o + self.cond_layer(g)
++
++        for i in range(self.num_upsamples):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            o = self.ups[i](o)
++            
++            z_sum = None
++            for j in range(self.num_kernels):
++                if z_sum is None:
++                    z_sum = self.resblocks[i*self.num_kernels+j](o)
++                else:
++                    z_sum += self.resblocks[i*self.num_kernels+j](o)
++            o = z_sum / self.num_kernels
++            
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        coarse_audio = torch.tanh(o) # [Batch, 1, Time]
++        
++        # 2. Refine Audio (Mamba)
++        # Ham sesi al, düzeltilmiş halini ver
++        refined_audio = self.refiner(coarse_audio)
++        
++        # Değerlerin -1 ile 1 arasında kalmasını garantiye al
++        return torch.tanh(refined_audio)
++
++    def remove_weight_norm(self):
++        print('Removing weight norm...')
++        remove_weight_norm(self.conv_pre)
++        for l in self.ups: remove_weight_norm(l)
++        for l in self.resblocks: l.remove_weight_norm()
++        remove_weight_norm(self.conv_post)
++        if hasattr(self, "cond_layer"): remove_weight_norm(self.cond_layer)
++        
++        # Refiner temizliği
++        self.refiner.remove_weight_norm()
++
++    @torch.no_grad()
++    def inference(self, c, padding=True):
++        if padding:
++            c = torch.nn.functional.pad(c, (self.inference_padding, self.inference_padding), "replicate")
++        return self.forward(c)
++
++
++
++class MambaModulator(nn.Module):
++    """
++    Mamba based FiLM Generator.
++    Input: [B, C, T]
++    Output: Gamma (Scale) [B, C, T] and Beta (Shift) [B, C, T]
++    """
++    def __init__(self, channels, d_state=64):
++        super().__init__()
++        if Mamba2 is None:
++            raise ImportError("mamba_ssm is required")
++        
++        # Mamba Core
++        self.forward_mamba = Mamba2(d_model=channels, d_state=d_state, d_conv=4, expand=2)
++        self.backward_mamba = Mamba2(d_model=channels, d_state=d_state, d_conv=4, expand=2)
++        self.norm = nn.LayerNorm(channels)
++        
++        # Projection to 2x Channels (Gamma + Beta)
++        # 1x1 Conv ile kanal sayısını ikiye katlıyoruz.
++        self.proj = nn.Conv1d(channels, channels * 2, kernel_size=1)
++
++    def forward(self, x):
++        # x: [B, C, T]
++        x_t = x.transpose(1, 2)
++        out = self.forward_mamba(x_t) + self.backward_mamba(x_t.flip(1)).flip(1)
++        out = self.norm(out).transpose(1, 2) # [B, C, T]
++        
++        # Scale ve Shift üret
++        stats = self.proj(out) # [B, 2*C, T]
++        gamma, beta = stats.chunk(2, dim=1)
++        
++        return gamma, beta
++    
++    def remove_weight_norm(self):
++        pass
++
++class MambaSEBlock(nn.Module):
++    """
++    Mamba-based Squeeze-and-Excitation (SE) Block.
++    FIXED: Added 'headdim' parameter to prevent Mamba2 assertion errors on small channels.
++    """
++    def __init__(self, channels, d_state=16):
++        super().__init__()
++        if Mamba2 is None: raise ImportError("mamba_ssm required")
++        
++        # Kanal sayısını azaltıp (Squeeze) işlem maliyetini düşürüyoruz
++        self.reduction_ratio = 4
++        # En az 8 kanala düşsün, daha aşağısı olmasın
++        reduced_channels = max(channels // self.reduction_ratio, 8)
++        
++        self.input_proj = nn.Conv1d(channels, reduced_channels, 1)
++        
++        # --- FIX BURADA ---
++        # Mamba2 varsayılan headdim=64'tür. 
++        # Reduced channels 64'ten küçükse (örn: 32, 16, 8) hata verir.
++        # Bu yüzden headdim'i reduced_channels'a eşitliyoruz.
++        self.mamba = Mamba2(
++            d_model=reduced_channels, 
++            d_state=d_state, 
++            d_conv=2, 
++            expand=1,
++            headdim=reduced_channels  # <--- BU SATIR HATAYI ÇÖZER
++        )
++        # ------------------
++        
++        self.output_proj = nn.Conv1d(reduced_channels, channels, 1)
++        self.act = nn.Sigmoid() 
++
++    def forward(self, x):
++        # x: [Batch, Channel, Time]
++        residual = x
++        
++        # 1. Squeeze
++        x_squeezed = self.input_proj(x)
++        
++        # 2. Mamba Process
++        # [B, C, T] -> [B, T, C]
++        x_mamba = self.mamba(x_squeezed.transpose(1, 2)).transpose(1, 2)
++        
++        # 3. Excitation
++        weights = self.output_proj(x_mamba)
++        weights = self.act(weights) 
++        
++        # 4. Re-weight
++        return residual * weights
++        
++    def remove_weight_norm(self): 
++        pass
++
++class HifiganGeneratorMambaSE(torch.nn.Module):
++    """
++    HiFiGAN with Mamba-SE (Channel Attention).
++    
++    Design:
++    - Standard HiFi-GAN Backbone (3 Kernels: 3, 7, 11) - Nothing removed!
++    - After each Upsample+MRF stage, a 'MambaSEBlock' recalibrates the features.
++    
++    Why:
++    - Preserves Texture (Conv generates the signal).
++    - Adds Structure (Mamba adjusts the feature weights based on global context).
++    """
++
++    def __init__(
++        self,
++        in_channels, 
++        out_channels,
++        resblock_type,
++        resblock_dilation_sizes,
++        resblock_kernel_sizes,
++        upsample_kernel_sizes,
++        upsample_initial_channel,
++        upsample_factors,
++        inference_padding=5,
++        cond_channels=0,
++        conv_post_bias=True,
++    ):
++        super().__init__()
++        
++        # --- KANAL KİLİDİ ---
++        in_channels = 80 
++        # --------------------
++
++        self.inference_padding = inference_padding
++        self.num_kernels = len(resblock_kernel_sizes)
++        self.num_upsamples = len(upsample_factors)
++        
++        resblock = ResBlock1 if resblock_type == "1" else ResBlock2
++
++        # 1. Initial Conv
++        self.conv_pre = weight_norm(nn.Conv1d(
++            in_channels=in_channels,
++            out_channels=upsample_initial_channel,
++            kernel_size=7,
++            stride=1,
++            padding=3
++        ))
++        
++        # 2. Layers
++        self.ups = nn.ModuleList()
++        self.resblocks = nn.ModuleList()
++        self.mamba_se_blocks = nn.ModuleList() # YENİ: Attention Blokları
++
++        for i, (u, k) in enumerate(zip(upsample_factors, upsample_kernel_sizes)):
++            # Upsample
++            self.ups.append(weight_norm(
++                nn.ConvTranspose1d(
++                    in_channels=upsample_initial_channel // (2**i),
++                    out_channels=upsample_initial_channel // (2**(i+1)),
++                    kernel_size=k,
++                    stride=u,
++                    padding=(k-u)//2
++                )
++            ))
++            
++            current_ch = upsample_initial_channel // (2**(i+1))
++            
++            # MRF (Orijinal yapıyı koruyoruz)
++            for j, (k_res, d_res) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
++                self.resblocks.append(resblock(current_ch, k_res, d_res))
++            
++            # --- NOVELTY: Mamba SE Block ---
++            # MRF çıkışını "düzenlemek" için ekliyoruz.
++            self.mamba_se_blocks.append(MambaSEBlock(channels=current_ch))
++
++        # 3. Post Conv
++        self.conv_post = weight_norm(nn.Conv1d(
++            in_channels=current_ch, 
++            out_channels=1, 
++            kernel_size=7, 
++            stride=1, 
++            padding=3,
++            bias=conv_post_bias
++        ))
++        
++        if cond_channels > 0:
++            self.cond_layer = weight_norm(nn.Conv1d(cond_channels, upsample_initial_channel, 1))
++
++        self.apply(init_weights)
++
++    def forward(self, x, g=None):
++        o = self.conv_pre(x)
++        if hasattr(self, "cond_layer"):
++            o = o + self.cond_layer(g)
++
++        for i in range(self.num_upsamples):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            o = self.ups[i](o) # Upsample
++            
++            # MRF İşlemi (Doku Üretimi)
++            z_sum = None
++            for j in range(self.num_kernels):
++                if z_sum is None:
++                    z_sum = self.resblocks[i*self.num_kernels+j](o)
++                else:
++                    z_sum += self.resblocks[i*self.num_kernels+j](o)
++            
++            o = z_sum / self.num_kernels
++            
++            # --- MAMBA ATTENTION ---
++            # "Ürettiğin özelliklerin hangileri önemli, hangileri gürültü?"
++            # Mamba burada bir filtre/maske uygular.
++            o = self.mamba_se_blocks[i](o)
++            # -----------------------
++            
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        o = torch.tanh(o)
++        return o
++
++    def remove_weight_norm(self):
++        print('Removing weight norm...')
++        remove_weight_norm(self.conv_pre)
++        for l in self.ups: remove_weight_norm(l)
++        for l in self.resblocks: l.remove_weight_norm()
++        # Mamba SE temizliği (proj layerlarında weight norm yok ama loop bozulmasın)
++        for l in self.mamba_se_blocks: l.remove_weight_norm()
++            
++        remove_weight_norm(self.conv_post)
++        if hasattr(self, "cond_layer"): remove_weight_norm(self.cond_layer)
++
++    @torch.no_grad()
++    def inference(self, c, padding=True):
++        if padding:
++            c = torch.nn.functional.pad(c, (self.inference_padding, self.inference_padding), "replicate")
++        return self.forward(c)
++
++
++class HifiganGeneratorBroadcast(torch.nn.Module):
++    """
++    HiFiGAN with Global Context Broadcasting.
++    
++    Novelty:
++    - Main Stream: Pure HiFi-GAN (Preserves Texture/FM Loss).
++    - Side Stream: Mamba processes the Mel-Spec ONCE at the start.
++    - Broadcasting: Mamba features are upsampled and injected into EVERY layer of HiFi-GAN.
++    
++    This avoids 'oversmoothing' because the waveform never passes THROUGH Mamba layers.
++    Mamba acts as a read-only 'Conductor' giving cues to the Conv 'Musicians'.
++    """
++
++    def __init__(
++        self,
++        in_channels, 
++        out_channels,
++        resblock_type,
++        resblock_dilation_sizes,
++        resblock_kernel_sizes,
++        upsample_kernel_sizes,
++        upsample_initial_channel,
++        upsample_factors,
++        inference_padding=5,
++        cond_channels=0,
++        conv_post_bias=True,
++    ):
++        super().__init__()
++        
++        # --- KANAL KİLİDİ ---
++        in_channels = 80 
++        # --------------------
++
++        self.inference_padding = inference_padding
++        self.num_kernels = len(resblock_kernel_sizes)
++        self.num_upsamples = len(upsample_factors)
++        
++        resblock = ResBlock1 if resblock_type == "1" else ResBlock2
++
++        # --- 1. SIDE STREAM (Mamba Context Encoder) ---
++        # Girişteki Mel-Spectrogram'ı işleyip güçlü bir context çıkarır.
++        # d_model=128 veya 256 olabilir, çünkü sadece 1 kez çalışacak.
++        self.mamba_context_encoder = nn.Sequential(
++             weight_norm(nn.Conv1d(in_channels, 128, 7, 1, padding=3)),
++             BiMamba2Block(channels=128, d_state=64),
++             BiMamba2Block(channels=128, d_state=64)
++        )
++        # ----------------------------------------------
++
++        # 2. Main Stream Initial Conv
++        self.conv_pre = weight_norm(nn.Conv1d(
++            in_channels=in_channels,
++            out_channels=upsample_initial_channel,
++            kernel_size=7,
++            stride=1,
++            padding=3
++        ))
++        
++        # 3. Layers
++        self.ups = nn.ModuleList()
++        self.resblocks = nn.ModuleList()
++        self.context_projections = nn.ModuleList() # Mamba bilgisini Conv boyutuna uydurmak için
++
++        for i, (u, k) in enumerate(zip(upsample_factors, upsample_kernel_sizes)):
++            # Upsample Layer
++            self.ups.append(weight_norm(
++                nn.ConvTranspose1d(
++                    in_channels=upsample_initial_channel // (2**i),
++                    out_channels=upsample_initial_channel // (2**(i+1)),
++                    kernel_size=k,
++                    stride=u,
++                    padding=(k-u)//2
++                )
++            ))
++            
++            current_ch = upsample_initial_channel // (2**(i+1))
++            
++            # MRF Blocks (Orijinal HiFi-GAN, hiçbir şeyi silmiyoruz!)
++            for j, (k_res, d_res) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
++                self.resblocks.append(resblock(current_ch, k_res, d_res))
++            
++            # --- BROADCAST ADAPTER ---
++            # Mamba'nın çıkışı (128) -> O anki Conv kanalı (current_ch)
++            self.context_projections.append(weight_norm(
++                nn.Conv1d(128, current_ch, 1)
++            ))
++
++        # 4. Post Conv
++        self.conv_post = weight_norm(nn.Conv1d(
++            in_channels=current_ch, 
++            out_channels=1, 
++            kernel_size=7, 
++            stride=1, 
++            padding=3,
++            bias=conv_post_bias
++        ))
++        
++        if cond_channels > 0:
++            self.cond_layer = weight_norm(nn.Conv1d(cond_channels, upsample_initial_channel, 1))
++
++        self.apply(init_weights)
++
++    def forward(self, x, g=None):
++        # x: [Batch, 80, Time_Mel]
++        
++        # --- ADIM 1: GLOBAL CONTEXT OLUŞTUR (Yan Hat) ---
++        # Mel-spectrogram'ı Mamba ile işle.
++        # Bu context, tüm cümlenin yapısını bilir.
++        global_context = self.mamba_context_encoder(x) 
++        # global_context: [Batch, 128, Time_Mel]
++        # ------------------------------------------------
++
++        # --- ADIM 2: ANA HAT (Main Stream) ---
++        o = self.conv_pre(x)
++        if hasattr(self, "cond_layer"):
++            o = o + self.cond_layer(g)
++
++        for i in range(self.num_upsamples):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            
++            # Upsample (Boyut Büyür)
++            o = self.ups[i](o)
++            # o boyutu: [Batch, Ch, Time_HighRes]
++            
++            # --- BROADCASTING (ENJEKSİYON) ---
++            # Mamba Context'ini o anki boyuta uydur (Interpolate)
++            ctx_upsampled = F.interpolate(
++                global_context, 
++                size=o.shape[2], # Hedef zaman boyutu
++                mode='linear',   # Veya 'nearest'
++                align_corners=False
++            )
++            
++            # Kanal sayısını uydur (Projection)
++            ctx_projected = self.context_projections[i](ctx_upsampled)
++            
++            # Ana hatta ekle (Injection)
++            o = o + ctx_projected
++            # ---------------------------------
++            
++            # MRF İşlemleri (Texture Generation)
++            z_sum = None
++            for j in range(self.num_kernels):
++                if z_sum is None:
++                    z_sum = self.resblocks[i*self.num_kernels+j](o)
++                else:
++                    z_sum += self.resblocks[i*self.num_kernels+j](o)
++            
++            o = z_sum / self.num_kernels
++            
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        o = torch.tanh(o)
++        return o
++
++    def remove_weight_norm(self):
++        print('Removing weight norm...')
++        remove_weight_norm(self.conv_pre)
++        for l in self.ups: remove_weight_norm(l)
++        for l in self.resblocks: l.remove_weight_norm()
++        
++        # Mamba Encoder Temizliği
++        for layer in self.mamba_context_encoder:
++            if hasattr(layer, "remove_weight_norm"): layer.remove_weight_norm()
++            if isinstance(layer, BiMamba2Block): layer.remove_weight_norm()
++            
++        for l in self.context_projections: remove_weight_norm(l)
++            
++        remove_weight_norm(self.conv_post)
++        if hasattr(self, "cond_layer"): remove_weight_norm(self.cond_layer)
++
++    @torch.no_grad()
++    def inference(self, c, padding=True):
++        if padding:
++            c = torch.nn.functional.pad(c, (self.inference_padding, self.inference_padding), "replicate")
++        return self.forward(c)
++
++
++
++
++
++
++
++
++
++
++
++
++
++
++class HifiganGeneratorMambaMRF_Gated(torch.nn.Module):
++    """
++    HiFiGAN with Mamba-MRF Replacement AND Gated Fusion.
++    
++    Architecture:
++    1. Replacement: Largest Conv Kernel (11) is REMOVED and REPLACED by Mamba.
++    2. Gating: Mamba (Structure) and remaining Convs (Texture) are fused via a learnable gate.
++    
++    This combines the low L1 loss capability of Gating with the clean separation of Replacement.
++    """
++
++    def __init__(
++        self,
++        in_channels, 
++        out_channels,
++        resblock_type,
++        resblock_dilation_sizes,
++        resblock_kernel_sizes,
++        upsample_kernel_sizes,
++        upsample_initial_channel,
++        upsample_factors,
++        inference_padding=5,
++        cond_channels=0,
++        conv_post_bias=True,
++    ):
++        super().__init__()
++        
++        # --- KANAL KİLİDİ: 80 ---
++        in_channels = 80 
++        # ----------------------
++
++        self.inference_padding = inference_padding
++        self.num_upsamples = len(upsample_factors)
++        
++        # Replacement Mantığı: Son kernel'i atıyoruz.
++        self.num_conv_kernels = len(resblock_kernel_sizes) - 1 
++        
++        resblock = ResBlock1 if resblock_type == "1" else ResBlock2
++
++        # 1. Initial Conv
++        self.conv_pre = weight_norm(nn.Conv1d(
++            in_channels=in_channels,
++            out_channels=upsample_initial_channel,
++            kernel_size=7,
++            stride=1,
++            padding=3
++        ))
++        
++        # 2. Layers
++        self.ups = nn.ModuleList()
++        self.mambas = nn.ModuleList() 
++        self.resblocks = nn.ModuleList()
++        
++        # --- GATING PARAMETRELERİ ---
++        self.mixing_gates = nn.ParameterList()
++
++        # ResBlock parametrelerini ayıkla (Sonuncuyu atıyoruz!)
++        active_kernel_sizes = resblock_kernel_sizes[:self.num_conv_kernels]
++        active_dilation_sizes = resblock_dilation_sizes[:self.num_conv_kernels]
++
++        for i, (u, k) in enumerate(zip(upsample_factors, upsample_kernel_sizes)):
++            # Upsample
++            self.ups.append(weight_norm(
++                nn.ConvTranspose1d(
++                    in_channels=upsample_initial_channel // (2**i),
++                    out_channels=upsample_initial_channel // (2**(i+1)),
++                    kernel_size=k,
++                    stride=u,
++                    padding=(k-u)//2
++                )
++            ))
++            
++            ch = upsample_initial_channel // (2**(i+1))
++            
++            # A. Mamba Branch (Structure - Kernel 11'in yerine)
++            self.mambas.append(BiMamba2Block(channels=ch, d_state=64))
++            
++            # B. Conv Branches (Texture - Kernel 3 ve 7)
++            for j, (k_res, d_res) in enumerate(zip(active_kernel_sizes, active_dilation_sizes)):
++                self.resblocks.append(resblock(ch, k_res, d_res))
++            
++            # C. Gate Parametresi (Her katman için 1 tane öğrenilebilir sayı)
++            self.mixing_gates.append(nn.Parameter(torch.zeros(1)))
++
++        # 3. Post Conv
++        self.conv_post = weight_norm(nn.Conv1d(
++            in_channels=ch, 
++            out_channels=1, 
++            kernel_size=7, 
++            stride=1, 
++            padding=3,
++            bias=conv_post_bias
++        ))
++        
++        if cond_channels > 0:
++            self.cond_layer = weight_norm(nn.Conv1d(cond_channels, upsample_initial_channel, 1))
++
++        self.apply(init_weights)
++
++    def forward(self, x, g=None):
++        o = self.conv_pre(x)
++        if hasattr(self, "cond_layer"):
++            o = o + self.cond_layer(g)
++
++        for i in range(self.num_upsamples):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            o = self.ups[i](o) 
++            
++            # --- REPLACEMENT + GATED FUSION ---
++            
++            # 1. Conv Dalları (Texture)
++            conv_sum = None
++            for j in range(self.num_conv_kernels):
++                res_out = self.resblocks[i*self.num_conv_kernels + j](o)
++                if conv_sum is None:
++                    conv_sum = res_out
++                else:
++                    conv_sum += res_out
++            
++            # Conv Ortalaması
++            conv_out = conv_sum / self.num_conv_kernels
++            
++            # 2. Mamba Dalı (Structure)
++            mamba_out = self.mambas[i](o)
++            
++            # 3. Gated Mixing
++            # Alpha: Ne kadar Mamba kullanacağız?
++            alpha = torch.sigmoid(self.mixing_gates[i])
++            
++            # Karışım: alpha * Mamba + (1-alpha) * Conv
++            o = (alpha * mamba_out) + ((1 - alpha) * conv_out)
++            # -------------------------------------
++            
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        o = torch.tanh(o)
++        return o
++
++    def remove_weight_norm(self):
++        print('Removing weight norm...')
++        remove_weight_norm(self.conv_pre)
++        for l in self.ups: remove_weight_norm(l)
++        for l in self.resblocks: l.remove_weight_norm()
++        for l in self.mambas: 
++            if hasattr(l, "remove_weight_norm"): l.remove_weight_norm()
++        remove_weight_norm(self.conv_post)
++        if hasattr(self, "cond_layer"): remove_weight_norm(self.cond_layer)
++
++    @torch.no_grad()
++    def inference(self, c, padding=True):
++        if padding:
++            c = torch.nn.functional.pad(c, (self.inference_padding, self.inference_padding), "replicate")
++        return self.forward(c)
++
++
++
++class HifiganGeneratorConcat(torch.nn.Module):
++    """
++    HiFiGAN with Concatenation Fusion Strategy.
++    
++    Logic:
++    Instead of adding (summing) Conv and Mamba outputs, we CONCATENATE them along the channel dimension.
++    Then, a 1x1 Convolution projects them back to the original channel size.
++    This preserves distinct features from both modalities without cancellation.
++    """
++
++    def __init__(
++        self,
++        in_channels, 
++        out_channels,
++        resblock_type,
++        resblock_dilation_sizes,
++        resblock_kernel_sizes,
++        upsample_kernel_sizes,
++        upsample_initial_channel,
++        upsample_factors,
++        inference_padding=5,
++        cond_channels=0,
++        conv_post_bias=True,
++    ):
++        super().__init__()
++        
++        # --- KANAL KİLİDİ ---
++        in_channels = 80 
++        # --------------------
++
++        self.inference_padding = inference_padding
++        self.num_kernels = len(resblock_kernel_sizes)
++        self.num_upsamples = len(upsample_factors)
++        
++        resblock = ResBlock1 if resblock_type == "1" else ResBlock2
++
++        # 1. Initial Conv
++        self.conv_pre = weight_norm(nn.Conv1d(
++            in_channels=in_channels,
++            out_channels=upsample_initial_channel,
++            kernel_size=7,
++            stride=1,
++            padding=3
++        ))
++        
++        # 2. Layers
++        self.ups = nn.ModuleList()
++        self.mambas = nn.ModuleList()
++        self.resblocks = nn.ModuleList()
++        self.fusion_projs = nn.ModuleList() # Kanal sayısını düşürmek için 1x1 Convlar
++
++        for i, (u, k) in enumerate(zip(upsample_factors, upsample_kernel_sizes)):
++            # A. Upsample Layer
++            self.ups.append(weight_norm(
++                nn.ConvTranspose1d(
++                    in_channels=upsample_initial_channel // (2**i),
++                    out_channels=upsample_initial_channel // (2**(i+1)),
++                    kernel_size=k,
++                    stride=u,
++                    padding=(k-u)//2
++                )
++            ))
++            
++            current_ch = upsample_initial_channel // (2**(i+1))
++            
++            # B. Mamba Block
++            self.mambas.append(BiMamba2Block(channels=current_ch, d_state=128))
++            
++            # C. ResBlocks (MRF)
++            for j, (k_res, d_res) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
++                self.resblocks.append(resblock(current_ch, k_res, d_res))
++            
++            # D. Fusion Projection (1x1 Conv)
++            # Girdi Kanalları = (Conv Sayısı * ch) + (Mamba * ch)
++            # ResBlock sayısı genelde 3'tür (num_kernels). Mamba 1 tane.
++            # Toplam giriş kanalı = (num_kernels + 1) * current_ch
++            total_concat_channels = (self.num_kernels + 1) * current_ch
++            
++            self.fusion_projs.append(weight_norm(
++                nn.Conv1d(
++                    in_channels=total_concat_channels,
++                    out_channels=current_ch,
++                    kernel_size=1 # 1x1 Conv sadece kanalları karıştırır
++                )
++            ))
++
++        # 3. Post Conv
++        self.conv_post = weight_norm(nn.Conv1d(
++            in_channels=current_ch, 
++            out_channels=1, 
++            kernel_size=7, 
++            stride=1, 
++            padding=3,
++            bias=conv_post_bias
++        ))
++        
++        if cond_channels > 0:
++            self.cond_layer = weight_norm(nn.Conv1d(cond_channels, upsample_initial_channel, 1))
++
++        self.apply(init_weights)
++
++    def forward(self, x, g=None):
++        o = self.conv_pre(x)
++        if hasattr(self, "cond_layer"):
++            o = o + self.cond_layer(g)
++
++        for i in range(self.num_upsamples):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            o = self.ups[i](o) # Upsampling
++            
++            # --- CONCATENATION STRATEGY ---
++            features_to_concat = []
++            
++            # 1. Conv (MRF) Çıktılarını Topla
++            for j in range(self.num_kernels):
++                # ResBlock'lar o'yu alıp işler
++                conv_feat = self.resblocks[i*self.num_kernels+j](o)
++                features_to_concat.append(conv_feat)
++            
++            # 2. Mamba Çıktısını Topla
++            mamba_feat = self.mambas[i](o)
++            features_to_concat.append(mamba_feat)
++            
++            # 3. Hepsini Yapıştır (Concatenate)
++            # Boyut: [Batch, (Kernels+1)*Ch, Time]
++            concat_out = torch.cat(features_to_concat, dim=1)
++            
++            # 4. Projeksiyon ile Boyutu Geri Düşür
++            # Boyut: [Batch, Ch, Time]
++            o = self.fusion_projs[i](concat_out)
++            # ------------------------------
++            
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        o = torch.tanh(o)
++        return o
++
++    def remove_weight_norm(self):
++        print('Removing weight norm...')
++        remove_weight_norm(self.conv_pre)
++        for l in self.ups: remove_weight_norm(l)
++        for l in self.resblocks: l.remove_weight_norm()
++        for l in self.mambas: 
++            if hasattr(l, "remove_weight_norm"): l.remove_weight_norm()
++        for l in self.fusion_projs: remove_weight_norm(l)
++            
++        remove_weight_norm(self.conv_post)
++        if hasattr(self, "cond_layer"): remove_weight_norm(self.cond_layer)
++
++    @torch.no_grad()
++    def inference(self, c, padding=True):
++        if padding:
++            c = torch.nn.functional.pad(c, (self.inference_padding, self.inference_padding), "replicate")
++        return self.forward(c)
++
++
++
++class HifiganGeneratorMambaFiLM(torch.nn.Module):
++    """
++    HiFiGAN with Mamba-Based Feature-wise Linear Modulation (FiLM).
++    
++    Novelty:
++    Instead of adding Mamba features (residual), we use Mamba to dynamicallly
++    scale and shift the convolutional features. This separates 'Structure' (Mamba)
++    from 'Texture' (Conv).
++    """
++
++    def __init__(
++        self,
++        in_channels, 
++        out_channels,
++        resblock_type,
++        resblock_dilation_sizes,
++        resblock_kernel_sizes,
++        upsample_kernel_sizes,
++        upsample_initial_channel,
++        upsample_factors,
++        inference_padding=5,
++        cond_channels=0,
++        conv_post_bias=True,
++    ):
++        super().__init__()
++        
++        # --- KANAL KİLİDİ ---
++        in_channels = 80 
++        # --------------------
++
++        self.inference_padding = inference_padding
++        self.num_kernels = len(resblock_kernel_sizes)
++        self.num_upsamples = len(upsample_factors)
++        
++        resblock = ResBlock1 if resblock_type == "1" else ResBlock2
++
++        # 1. Initial Conv
++        self.conv_pre = weight_norm(nn.Conv1d(
++            in_channels=in_channels,
++            out_channels=upsample_initial_channel,
++            kernel_size=7,
++            stride=1,
++            padding=3
++        ))
++        
++        # 2. Upsampling Layers
++        self.ups = nn.ModuleList()
++        for i, (u, k) in enumerate(zip(upsample_factors, upsample_kernel_sizes)):
++            self.ups.append(weight_norm(
++                nn.ConvTranspose1d(
++                    in_channels=upsample_initial_channel // (2**i),
++                    out_channels=upsample_initial_channel // (2**(i+1)),
++                    kernel_size=k,
++                    stride=u,
++                    padding=(k-u)//2
++                )
++            ))
++
++        # 3. Mamba Modulators ve MRF Blocks
++        self.mamba_modulators = nn.ModuleList()
++        self.resblocks = nn.ModuleList()
++        
++        for i in range(len(self.ups)):
++            ch = upsample_initial_channel // (2**(i+1))
++            
++            # --- NOVELTY: Mamba Modulator ---
++            # Her upsample bloğu için bir yönetici Mamba
++            # Hafıza yükünü azaltmak için d_state=64 yeterli
++            self.mamba_modulators.append(MambaModulator(channels=ch, d_state=128))
++            
++            for j, (k, d) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
++                self.resblocks.append(resblock(ch, k, d))
++
++        # 4. Post Conv
++        self.conv_post = weight_norm(nn.Conv1d(
++            in_channels=ch, 
++            out_channels=1, 
++            kernel_size=7, 
++            stride=1, 
++            padding=3,
++            bias=conv_post_bias
++        ))
++        
++        if cond_channels > 0:
++            self.cond_layer = weight_norm(nn.Conv1d(cond_channels, upsample_initial_channel, 1))
++
++        self.apply(init_weights)
++
++    def forward(self, x, g=None):
++        o = self.conv_pre(x)
++        if hasattr(self, "cond_layer"):
++            o = o + self.cond_layer(g)
++
++        for i in range(self.num_upsamples):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            o = self.ups[i](o) # Upsampling
++            
++            # --- FiLM MODULATION START ---
++            # 1. Mamba'dan Scale (gamma) ve Shift (beta) al
++            gamma, beta = self.mamba_modulators[i](o)
++            
++            # 2. Modülasyon Uygula
++            # Formül: x * (1 + tanh(gamma)) + beta
++            # tanh kullanıyoruz ki scale faktörü patlamasın (stabilite için)
++            o_modulated = o * (1 + torch.tanh(gamma)) + beta
++            # -----------------------------
++            
++            # 3. MRF (Texture Generation)
++            # MRF blokları artık Mamba tarafından 'yönetilmiş' sinyali işler
++            z_sum = None
++            for j in range(self.num_kernels):
++                if z_sum is None:
++                    z_sum = self.resblocks[i*self.num_kernels+j](o_modulated)
++                else:
++                    z_sum += self.resblocks[i*self.num_kernels+j](o_modulated)
++            
++            o = z_sum / self.num_kernels
++            
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        o = torch.tanh(o)
++        return o
++
++    def remove_weight_norm(self):
++        remove_weight_norm(self.conv_pre)
++        for l in self.ups: remove_weight_norm(l)
++        for l in self.resblocks: l.remove_weight_norm()
++        for l in self.mamba_modulators: l.remove_weight_norm()
++        remove_weight_norm(self.conv_post)
++        if hasattr(self, "cond_layer"): remove_weight_norm(self.cond_layer)
++
++    @torch.no_grad()
++    def inference(self, c, padding=True):
++        if padding:
++            c = torch.nn.functional.pad(c, (self.inference_padding, self.inference_padding), "replicate")
++        return self.forward(c)
++
++
++
++
++
++class HifiganGeneratorLateMamba(torch.nn.Module):
++    """
++    HiFiGAN with Late-Stage Mamba Strategy.
++    
++    Logic:
++    Mamba is applied ONLY in the FINAL upsampling stages (High Resolution).
++    Hypothesis: This helps correct Phase consistency in the raw waveform domain.
++    """
++
++    def __init__(
++        self,
++        in_channels, 
++        out_channels,
++        resblock_type,
++        resblock_dilation_sizes,
++        resblock_kernel_sizes,
++        upsample_kernel_sizes,
++        upsample_initial_channel,
++        upsample_factors,
++        inference_padding=5,
++        cond_channels=0,
++        conv_post_bias=True,
++    ):
++        super().__init__()
++        
++        # --- ACİL DURUM: Kanal Kilidi (Veri setine göre 80) ---
++        in_channels = 80 
++        # ------------------------------------------------------
++
++        self.inference_padding = inference_padding
++        self.num_kernels = len(resblock_kernel_sizes)
++        self.num_upsamples = len(upsample_factors)
++        
++        # STRATEJİ: Mamba ne zaman devreye girsin?
++        # Sadece son 2 blokta çalışsın (En yüksek çözünürlük)
++        # Örn: 4 katman varsa, index 2 ve 3'te çalışır.
++        self.mamba_start_index = self.num_upsamples - 2
++        
++        resblock = ResBlock1 if resblock_type == "1" else ResBlock2
++
++        # 1. Initial Conv
++        self.conv_pre = weight_norm(nn.Conv1d(
++            in_channels=in_channels,
++            out_channels=upsample_initial_channel,
++            kernel_size=7,
++            stride=1,
++            padding=3
++        ))
++        
++        # 2. Upsampling Layers
++        self.ups = nn.ModuleList()
++        for i, (u, k) in enumerate(zip(upsample_factors, upsample_kernel_sizes)):
++            self.ups.append(weight_norm(
++                nn.ConvTranspose1d(
++                    in_channels=upsample_initial_channel // (2**i),
++                    out_channels=upsample_initial_channel // (2**(i+1)),
++                    kernel_size=k,
++                    stride=u,
++                    padding=(k-u)//2
++                )
++            ))
++
++        # 3. Mamba ve MRF Blokları
++        self.mambas = nn.ModuleList()
++        self.resblocks = nn.ModuleList()
++        
++        for i in range(len(self.ups)):
++            ch = upsample_initial_channel // (2**(i+1))
++            
++            # --- STRATEJİ DEĞİŞİKLİĞİ ---
++            # Sadece SON bloklarsa Mamba ekle
++            if i >= self.mamba_start_index:
++                # Yüksek çözünürlükte hafıza patlamasın diye d_state küçültülebilir
++                # Ama şimdilik 64 ile deneyelim (Eski 128 idi)
++                self.mambas.append(BiMamba2Block(channels=ch, d_state=64))
++            
++            # MRF her zaman var
++            for j, (k, d) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
++                self.resblocks.append(resblock(ch, k, d))
++
++        # 4. Post Conv
++        self.conv_post = weight_norm(nn.Conv1d(
++            in_channels=ch, 
++            out_channels=1, 
++            kernel_size=7, 
++            stride=1, 
++            padding=3,
++            bias=conv_post_bias
++        ))
++        
++        if cond_channels > 0:
++            self.cond_layer = weight_norm(nn.Conv1d(cond_channels, upsample_initial_channel, 1))
++
++        self.apply(init_weights)
++
++    def forward(self, x, g=None):
++        o = self.conv_pre(x)
++        
++        if hasattr(self, "cond_layer"):
++            o = o + self.cond_layer(g)
++
++        mamba_idx = 0
++
++        for i in range(self.num_upsamples):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            
++            # Upsample
++            o = self.ups[i](o)
++            
++            # --- LATE STAGE MAMBA STRATEJİSİ ---
++            # Eğer son bloklardaysak Mamba'yı çalıştır
++            if i >= self.mamba_start_index:
++                mamba_block = self.mambas[mamba_idx]
++                
++                # Mamba'yı Residual olarak ekle
++                mamba_out = mamba_block(o)
++                o = o + mamba_out 
++                
++                mamba_idx += 1
++            # -----------------------------------
++            
++            # MRF (Conv) Texture İşleme
++            z_sum = None
++            for j in range(self.num_kernels):
++                if z_sum is None:
++                    z_sum = self.resblocks[i*self.num_kernels+j](o)
++                else:
++                    z_sum += self.resblocks[i*self.num_kernels+j](o)
++            
++            o = z_sum / self.num_kernels
++            
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        o = torch.tanh(o)
++        return o
++
++    def remove_weight_norm(self):
++        print('Removing weight norm...')
++        remove_weight_norm(self.conv_pre)
++        for l in self.ups: remove_weight_norm(l)
++        for l in self.resblocks: l.remove_weight_norm()
++        
++        # Mamba temizliği
++        for l in self.mambas: 
++            if hasattr(l, "remove_weight_norm"):
++                l.remove_weight_norm()
++            
++        remove_weight_norm(self.conv_post)
++        if hasattr(self, "cond_layer"): remove_weight_norm(self.cond_layer)
++
++    @torch.no_grad()
++    def inference(self, c, padding=True):
++        if padding:
++            c = torch.nn.functional.pad(c, (self.inference_padding, self.inference_padding), "replicate")
++        return self.forward(c)
++
++
++
++
++class HifiganGeneratorBottleneck(torch.nn.Module):
++    """
++    HiFiGAN with Bottleneck Mamba Strategy.
++    
++    Logic:
++    Mamba is applied ONLY in the low-resolution upsampling stages (Bottleneck).
++    High-resolution stages use only Convolution to preserve texture/fidelity.
++    """
++
++    def __init__(
++        self,
++        in_channels, 
++        out_channels,
++        resblock_type,
++        resblock_dilation_sizes,
++        resblock_kernel_sizes,
++        upsample_kernel_sizes,
++        upsample_initial_channel,
++        upsample_factors,
++        inference_padding=5,
++        cond_channels=0,
++        conv_post_bias=True,
++    ):
++        super().__init__()
++        
++        # --- ACİL DURUM YAMASI ---
++        # Veri setinden 80 kanal geldiği kesinleşti.
++        # YAML ne derse desin, burayı 80'e kilitliyoruz.
++        in_channels = 80 
++        # -------------------------
++
++        self.inference_padding = inference_padding
++        self.num_kernels = len(resblock_kernel_sizes)
++        self.num_upsamples = len(upsample_factors)
++        
++        # Mamba'nın çalışacağı sınır (Toplam katmanların yarısı)
++        # Örn: 4 katman varsa, sadece ilk 2'sinde (index 0 ve 1) Mamba çalışır.
++        self.mamba_cutoff_index = self.num_upsamples // 2
++        
++        # ResBlock Tipi
++        resblock = ResBlock1 if resblock_type == "1" else ResBlock2
++
++        # 1. Initial Convolution (Saf PyTorch)
++        self.conv_pre = weight_norm(nn.Conv1d(
++            in_channels=in_channels,
++            out_channels=upsample_initial_channel,
++            kernel_size=7,
++            stride=1,
++            padding=3
++        ))
++        
++        # 2. Upsampling Layers
++        self.ups = nn.ModuleList()
++        for i, (u, k) in enumerate(zip(upsample_factors, upsample_kernel_sizes)):
++            self.ups.append(weight_norm(
++                nn.ConvTranspose1d(
++                    in_channels=upsample_initial_channel // (2**i),
++                    out_channels=upsample_initial_channel // (2**(i+1)),
++                    kernel_size=k,
++                    stride=u,
++                    padding=(k-u)//2
++                )
++            ))
++
++        # 3. Mamba ve MRF Blokları
++        self.mambas = nn.ModuleList()
++        self.resblocks = nn.ModuleList()
++        
++        for i in range(len(self.ups)):
++            ch = upsample_initial_channel // (2**(i+1))
++            
++            # --- STRATEJİ: Mamba Sadece İlk Yarısında Var ---
++            if i < self.mamba_cutoff_index:
++                # Sadece cutoff öncesi katmanlar için Mamba oluşturuyoruz
++                self.mambas.append(BiMamba2Block(channels=ch, d_state=128))
++            
++            # MRF (Conv) her zaman var
++            for j, (k, d) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
++                self.resblocks.append(resblock(ch, k, d))
++
++        # 4. Post Convolution
++        self.conv_post = weight_norm(nn.Conv1d(
++            in_channels=ch, 
++            out_channels=1, 
++            kernel_size=7, 
++            stride=1, 
++            padding=3,
++            bias=conv_post_bias
++        ))
++        
++        if cond_channels > 0:
++            self.cond_layer = weight_norm(nn.Conv1d(cond_channels, upsample_initial_channel, 1))
++
++        # Ağırlıkları başlat
++        self.apply(init_weights)
++
++    def forward(self, x, g=None):
++        # x shape: [Batch, 80, Time]
++        o = self.conv_pre(x)
++        
++        if hasattr(self, "cond_layer"):
++            o = o + self.cond_layer(g)
++
++        # Mamba listesi için ayrı bir sayaç tutuyoruz
++        mamba_idx = 0
++
++        for i in range(self.num_upsamples):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            
++            # Upsample
++            o = self.ups[i](o)
++            
++            # --- BOTTLENECK STRATEJİSİ ---
++            # Sadece belirlenen index'ten küçükse Mamba uygula
++            if i < self.mamba_cutoff_index:
++                mamba_block = self.mambas[mamba_idx]
++                mamba_out = mamba_block(o)
++                o = o + mamba_out # Residual Bağlantı
++                mamba_idx += 1
++            # -----------------------------
++            
++            # MRF (Conv) Texture İşleme
++            z_sum = None
++            for j in range(self.num_kernels):
++                if z_sum is None:
++                    z_sum = self.resblocks[i*self.num_kernels+j](o)
++                else:
++                    z_sum += self.resblocks[i*self.num_kernels+j](o)
++            
++            o = z_sum / self.num_kernels
++            
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        o = torch.tanh(o)
++        return o
++
++    def remove_weight_norm(self):
++        print('Removing weight norm...')
++        remove_weight_norm(self.conv_pre)
++        for l in self.ups: remove_weight_norm(l)
++        for l in self.resblocks: l.remove_weight_norm()
++        
++        # Mamba'da weight norm yok ama fonksiyonu çağırmak gerekebilir
++        for l in self.mambas: 
++            if hasattr(l, "remove_weight_norm"):
++                l.remove_weight_norm()
++            
++        remove_weight_norm(self.conv_post)
++        if hasattr(self, "cond_layer"): remove_weight_norm(self.cond_layer)
++
++    @torch.no_grad()
++    def inference(self, c, padding=True):
++        if padding:
++            c = torch.nn.functional.pad(c, (self.inference_padding, self.inference_padding), "replicate")
++        return self.forward(c)
++
++
++
++
++
++
++class HifiganGeneratorWithPreNet(torch.nn.Module):
++    """
++    HiFiGAN with Mamba Context Pre-Net.
++    
++    Strategy:
++    Instead of interfering with the upsampling layers (which hurts texture/FM Loss),
++    we use Mamba ONLY at the beginning (low resolution) to inject global context.
++    The rest is standard HiFi-GAN to preserve high-fidelity texture.
++    """
++
++    def __init__(
++        self,
++        in_channels, 
++        out_channels,
++        resblock_type,
++        resblock_dilation_sizes,
++        resblock_kernel_sizes,
++        upsample_kernel_sizes,
++        upsample_initial_channel,
++        upsample_factors,
++        inference_padding=5,
++        cond_channels=0,
++        conv_post_bias=True,
++    ):
++        super().__init__()
++        
++        # --- ACİL DURUM: Kanal Sayısı Kilidi ---
++        in_channels = 80
++        # ---------------------------------------
++
++        self.inference_padding = inference_padding
++        self.num_kernels = len(resblock_kernel_sizes)
++        self.num_upsamples = len(upsample_factors)
++        
++        # ResBlock Import
++        from speechbrain.lobes.models.HifiGAN import ResBlock1, ResBlock2
++        resblock = ResBlock1 if resblock_type == "1" else ResBlock2
++
++        # 1. Initial Convolution
++        self.conv_pre = weight_norm(nn.Conv1d(
++            in_channels=in_channels,
++            out_channels=upsample_initial_channel,
++            kernel_size=7,
++            stride=1,
++            padding=3
++        ))
++        
++        # --- 2. MAMBA PRE-NET (YENİLİK BURADA) ---
++        # Sinyali bozmadan sadece "zenginleştirmek" için Residual Mamba kullanıyoruz.
++        # Düşük çözünürlükte (Mel seviyesinde) çalıştığı için çok güçlüdür.
++        self.mamba_prenet = BiMamba2Block(
++            channels=upsample_initial_channel, 
++            d_state=128  # Hafıza kapasitesi
++        )
++        # -----------------------------------------
++
++        # 3. Standard HiFi-GAN Upsampling (Orijinal Yapı)
++        self.ups = nn.ModuleList()
++        for i, (u, k) in enumerate(zip(upsample_factors, upsample_kernel_sizes)):
++            self.ups.append(weight_norm(
++                nn.ConvTranspose1d(
++                    in_channels=upsample_initial_channel // (2**i),
++                    out_channels=upsample_initial_channel // (2**(i+1)),
++                    kernel_size=k,
++                    stride=u,
++                    padding=(k-u)//2
++                )
++            ))
++
++        # 4. Standard HiFi-GAN MRF Blocks (Doku için)
++        self.resblocks = nn.ModuleList()
++        for i in range(len(self.ups)):
++            ch = upsample_initial_channel // (2**(i+1))
++            for j, (k, d) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
++                self.resblocks.append(resblock(ch, k, d))
++
++        # 5. Post Convolution
++        self.conv_post = weight_norm(nn.Conv1d(
++            in_channels=ch, 
++            out_channels=1, 
++            kernel_size=7, 
++            stride=1, 
++            padding=3,
++            bias=conv_post_bias
++        ))
++        
++        if cond_channels > 0:
++            self.cond_layer = weight_norm(nn.Conv1d(cond_channels, upsample_initial_channel, 1))
++
++        self.apply(init_weights)
++
++    def forward(self, x, g=None):
++        # 1. Giriş
++        o = self.conv_pre(x)
++        
++        if hasattr(self, "cond_layer"):
++            o = o + self.cond_layer(g)
++
++        # --- MAMBA CONTEXT INJECTION ---
++        # Sadece burada Mamba çalışır. Tüm cümlenin bağlamını yakalar.
++        # Residual bağlantı (o + mamba) sayesinde orijinal sinyali bozmaz, sadece düzeltir.
++        mamba_out = self.mambas_prenet(o) if hasattr(self, 'mambas_prenet') else self.mamba_prenet(o)
++        o = o + mamba_out
++        # -------------------------------
++
++        # 2. HiFi-GAN Gövdesi (Buraya dokunmuyoruz, texture bozulmasın diye)
++        for i in range(self.num_upsamples):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            o = self.ups[i](o) # Upsample
++            
++            z_sum = None
++            for j in range(self.num_kernels):
++                if z_sum is None:
++                    z_sum = self.resblocks[i*self.num_kernels+j](o)
++                else:
++                    z_sum += self.resblocks[i*self.num_kernels+j](o)
++            o = z_sum / self.num_kernels
++            
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        o = torch.tanh(o)
++        return o
++
++    def remove_weight_norm(self):
++        # Mamba Pre-Net temizliği
++        if hasattr(self.mamba_prenet, "remove_weight_norm"):
++            self.mamba_prenet.remove_weight_norm()
++            
++        remove_weight_norm(self.conv_pre)
++        for l in self.ups: remove_weight_norm(l)
++        for l in self.resblocks: l.remove_weight_norm()
++        remove_weight_norm(self.conv_post)
++        if hasattr(self, "cond_layer"): remove_weight_norm(self.cond_layer)
++
++    @torch.no_grad()
++    def inference(self, c, padding=True):
++        if padding:
++            c = torch.nn.functional.pad(c, (self.inference_padding, self.inference_padding), "replicate")
++        return self.forward(c)
++
++
++
++class HifiganGeneratorSerial(torch.nn.Module):
++    """
++    HiFiGAN Generator with Serial Mamba-Guided Refinement.
++    Re-written using pure torch.nn layers to avoid SpeechBrain wrapper conflicts.
++    """
++
++    def __init__(
++        self,
++        in_channels, 
++        out_channels,
++        resblock_type,
++        resblock_dilation_sizes,
++        resblock_kernel_sizes,
++        upsample_kernel_sizes,
++        upsample_initial_channel,
++        upsample_factors,
++        inference_padding=5,
++        cond_channels=0,
++        conv_post_bias=True,
++    ):
++        super().__init__()
++        self.inference_padding = inference_padding
++        self.num_kernels = len(resblock_kernel_sizes)
++        self.num_upsamples = len(upsample_factors)
++        
++        # ResBlock Tipini Belirle
++        resblock = ResBlock1 if resblock_type == "1" else ResBlock2
++
++        # ---------------------------------------------------------
++        # KATMAN 1: Initial Convolution (Saf PyTorch)
++        # ---------------------------------------------------------
++        # SpeechBrain'in Conv1d'si yerine nn.Conv1d kullanıyoruz.
++        # weight_norm'u manuel olarak sarıyoruz.
++        self.conv_pre = weight_norm(nn.Conv1d(
++            in_channels=in_channels,
++            out_channels=upsample_initial_channel,
++            kernel_size=7,
++            stride=1,
++            padding=3  # (kernel_size - 1) / 2 -> (7-1)/2 = 3 (Same padding)
++        ))
++        
++        # ---------------------------------------------------------
++        # KATMAN 2: Upsampling Layers (Saf PyTorch)
++        # ---------------------------------------------------------
++        self.ups = nn.ModuleList()
++        for i, (u, k) in enumerate(zip(upsample_factors, upsample_kernel_sizes)):
++            # Padding hesabı: (kernel - stride) // 2
++            p = (k - u) // 2
++            self.ups.append(weight_norm(
++                nn.ConvTranspose1d(
++                    in_channels=upsample_initial_channel // (2**i),
++                    out_channels=upsample_initial_channel // (2**(i+1)),
++                    kernel_size=k,
++                    stride=u,
++                    padding=p
++                )
++            ))
++
++        # ---------------------------------------------------------
++        # KATMAN 3: Serial Modules (Mamba + ResBlocks)
++        # ---------------------------------------------------------
++        self.mambas = nn.ModuleList()
++        self.resblocks = nn.ModuleList()
++        
++        for i in range(len(self.ups)):
++            ch = upsample_initial_channel // (2**(i+1))
++            
++            # Mamba
++            self.mambas.append(BiMamba2Block(channels=ch, d_state=128))
++            
++            # ResBlocks (SpeechBrain'den geldiği için weight_norm içindedir, dokunmuyoruz)
++            for j, (k, d) in enumerate(zip(resblock_kernel_sizes, resblock_dilation_sizes)):
++                self.resblocks.append(resblock(ch, k, d))
+ 
++        # ---------------------------------------------------------
++        # KATMAN 4: Post Convolution (Saf PyTorch)
++        # ---------------------------------------------------------
++        self.conv_post = weight_norm(nn.Conv1d(
++            in_channels=ch, 
++            out_channels=1, 
++            kernel_size=7, 
++            stride=1, 
++            padding=3,
++            bias=conv_post_bias
++        ))
++        
++        # Conditional Layer
++        if cond_channels > 0:
++            self.cond_layer = weight_norm(nn.Conv1d(
++                in_channels=cond_channels, 
++                out_channels=upsample_initial_channel, 
++                kernel_size=1
++            ))
+ 
+-def dynamic_range_compression(x, C=1, clip_val=1e-5):
+-    """Dynamique range compression for audio signals"""
+-    return torch.log(torch.clamp(x, min=clip_val) * C)
++        # Ağırlıkları Başlat
++        self.apply(init_weights)
+ 
++    def forward(self, x, g=None):
++        
++        # 1. Initial Conv
++        o = self.conv_pre(x)
++        
++        if hasattr(self, "cond_layer"):
++            o = o + self.cond_layer(g)
+ 
+-def mel_spectogram(
+-    sample_rate,
+-    hop_length,
+-    win_length,
+-    n_fft,
+-    n_mels,
+-    f_min,
+-    f_max,
+-    power,
+-    normalized,
+-    norm,
+-    mel_scale,
+-    compression,
+-    audio,
+-):
+-    """calculates MelSpectrogram for a raw audio signal
++        for i in range(self.num_upsamples):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            
++            # 2. Upsample
++            o = self.ups[i](o)
++            
++            # --- SERIAL REFINEMENT ---
++            
++            # 3. Mamba Context (Guidance)
++            mamba_context = self.mambas[i](o)
++            o_guided = o + mamba_context
++            
++            # 4. Conv MRF (Texture)
++            z_sum = None
++            for j in range(self.num_kernels):
++                if z_sum is None:
++                    z_sum = self.resblocks[i*self.num_kernels+j](o_guided)
++                else:
++                    z_sum += self.resblocks[i*self.num_kernels+j](o_guided)
++            
++            o = z_sum / self.num_kernels
++            
++        # 5. Final Post-Processing
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        o = torch.tanh(o)
++        return o
+ 
+-    Arguments
+-    ---------
+-    sample_rate : int
+-        Sample rate of audio signal.
+-    hop_length : int
+-        Length of hop between STFT windows.
+-    win_length : int
+-        Window size.
+-    n_fft : int
+-        Size of FFT.
+-    n_mels : int
+-        Number of mel filterbanks.
+-    f_min : float
+-        Minimum frequency.
+-    f_max : float
+-        Maximum frequency.
+-    power : float
+-        Exponent for the magnitude spectrogram.
+-    normalized : bool
+-        Whether to normalize by magnitude after stft.
+-    norm : str or None
+-        If "slaney", divide the triangular mel weights by the width of the mel band
+-    mel_scale : str
+-        Scale to use: "htk" or "slaney".
+-    compression : bool
+-        whether to do dynamic range compression
+-    audio : torch.tensor
+-        input audio signal
++    def remove_weight_norm(self):
++        print('Removing weight norm...')
++        # PyTorch weight_norm kaldırma
++        remove_weight_norm(self.conv_pre)
++        for l in self.ups: remove_weight_norm(l)
++        
++        # ResBlocks (SpeechBrain methodu)
++        for l in self.resblocks: l.remove_weight_norm()
++        
++        # Mamba
++        for l in self.mambas: l.remove_weight_norm()
++            
++        remove_weight_norm(self.conv_post)
++        if hasattr(self, "cond_layer"): remove_weight_norm(self.cond_layer)
+ 
+-    Returns
+-    -------
+-    Mel spectrogram
+-    """
++    @torch.no_grad()
++    def inference(self, c, padding=True):
++        if padding:
++            c = torch.nn.functional.pad(c, (self.inference_padding, self.inference_padding), "replicate")
++        return self.forward(c)
+ 
+-    audio_to_mel = transforms.MelSpectrogram(
+-        sample_rate=sample_rate,
+-        hop_length=hop_length,
+-        win_length=win_length,
+-        n_fft=n_fft,
+-        n_mels=n_mels,
+-        f_min=f_min,
+-        f_max=f_max,
+-        power=power,
+-        normalized=normalized,
+-        norm=norm,
+-        mel_scale=mel_scale,
+-    ).to(audio.device)
+ 
+-    mel = audio_to_mel(audio)
+ 
+-    if compression:
+-        mel = dynamic_range_compression(mel)
+ 
+-    return mel
+ 
+ 
+-def process_duration(code, code_feat):
+-    """
+-    Process a given batch of code to extract consecutive unique elements and their associated features.
+ 
++
++
++class HifiganGenerator(torch.nn.Module):
++    """HiFiGAN Generator with Multi-Receptive Field Fusion (MRF)
++    hybrid1
++
+     Arguments
+     ---------
+-    code : torch.Tensor (batch, time)
+-        Tensor of code indices.
+-    code_feat : torch.Tensor (batch, time, channel)
+-        Tensor of code features.
++    in_channels : int
++        number of input tensor channels.
++    out_channels : int
++        number of output tensor channels.
++    resblock_type : str
++        type of the `ResBlock`. '1' or '2'.
++    resblock_dilation_sizes : List[List[int]]
++        list of dilation values in each layer of a `ResBlock`.
++    resblock_kernel_sizes : List[int]
++        list of kernel sizes for each `ResBlock`.
++    upsample_kernel_sizes : List[int]
++        list of kernel sizes for each transposed convolution.
++    upsample_initial_channel : int
++        number of channels for the first upsampling layer. This is divided by 2
++        for each consecutive upsampling layer.
++    upsample_factors : List[int]
++        upsampling factors (stride) for each upsampling layer.
++    inference_padding : int
++       constant padding applied to the input at inference time. Defaults to 5.
++    cond_channels : int
++        If provided, adds a conv layer to the beginning of the forward.
++    conv_post_bias : bool
++        Whether to add a bias term to the final conv.
+ 
+-    Returns
+-    -------
+-    uniq_code_feat_filtered : torch.Tensor (batch, time)
+-        Features of consecutive unique codes.
+-    mask : torch.Tensor (batch, time)
+-        Padding mask for the unique codes.
+-    uniq_code_count : torch.Tensor (n)
+-        Count of unique codes.
+-
+     Example
+     -------
+-    >>> code = torch.IntTensor([[40, 18, 18, 10]])
+-    >>> code_feat = torch.rand([1, 4, 128])
+-    >>> out_tensor, mask, uniq_code = process_duration(code, code_feat)
++    >>> inp_tensor = torch.rand([4, 80, 33])
++    >>> hifigan_generator = HifiganGenerator(
++    ...     in_channels=80,
++    ...     out_channels=1,
++    ...     resblock_type="1",
++    ...     resblock_dilation_sizes=[[1, 3, 5], [1, 3, 5], [1, 3, 5]],
++    ...     resblock_kernel_sizes=[3, 7, 11],
++    ...     upsample_kernel_sizes=[16, 16, 4, 4],
++    ...     upsample_initial_channel=512,
++    ...     upsample_factors=[8, 8, 2, 2],
++    ... )
++    >>> out_tensor = hifigan_generator(inp_tensor)
+     >>> out_tensor.shape
+-    torch.Size([1, 1, 128])
+-    >>> mask.shape
+-    torch.Size([1, 1])
+-    >>> uniq_code.shape
+-    torch.Size([1])
+-    """
+-    uniq_code_count = []
+-    uniq_code_feat = []
+-    for i in range(code.size(0)):
+-        _, count = torch.unique_consecutive(code[i, :], return_counts=True)
+-        if len(count) > 2:
+-            # remove first and last code as segment sampling may cause incomplete segment length
+-            uniq_code_count.append(count[1:-1])
+-            uniq_code_idx = count.cumsum(dim=0)[:-2]
+-        else:
+-            uniq_code_count.append(count)
+-            uniq_code_idx = count.cumsum(dim=0) - 1
+-        uniq_code_feat.append(
+-            code_feat[i, uniq_code_idx, :].view(-1, code_feat.size(2))
+-        )
+-    uniq_code_count = torch.cat(uniq_code_count)
+-
+-    # collate
+-    max_len = max(feat.size(0) for feat in uniq_code_feat)
+-    uniq_code_feat_filtered = uniq_code_feat[0].new_zeros(
+-        (len(uniq_code_feat), max_len, uniq_code_feat[0].size(1))
+-    )
+-    mask = torch.arange(max_len).repeat(len(uniq_code_feat), 1)
+-    for i, v in enumerate(uniq_code_feat):
+-        uniq_code_feat_filtered[i, : v.size(0)] = v
+-        mask[i, :] = mask[i, :] < v.size(0)
+-
+-    return uniq_code_feat_filtered, mask.bool(), uniq_code_count.float()
+-
+-
+-##################################
+-# Generator
+-##################################
+-
+-
+-class ResBlock1(torch.nn.Module):
+-    """
+-    Residual Block Type 1, which has 3 convolutional layers in each convolution block.
+-
+-    Arguments
+-    ---------
+-    channels : int
+-        number of hidden channels for the convolutional layers.
+-    kernel_size : int
+-        size of the convolution filter in each layer.
+-    dilation : list
+-        list of dilation value for each conv layer in a block.
++    torch.Size([4, 1, 8448])
+     """
+ 
+-    def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5)):
++    def __init__(
++        self,
++        in_channels,
++        out_channels,
++        resblock_type,
++        resblock_dilation_sizes,
++        resblock_kernel_sizes,
++        upsample_kernel_sizes,
++        upsample_initial_channel,
++        upsample_factors,
++        inference_padding=5,
++        cond_channels=0,
++        conv_post_bias=True,
++    ):
+         super().__init__()
+-        self.convs1 = nn.ModuleList(
+-            [
+-                Conv1d(
+-                    in_channels=channels,
+-                    out_channels=channels,
+-                    kernel_size=kernel_size,
+-                    stride=1,
+-                    dilation=dilation[0],
+-                    padding="same",
+-                    skip_transpose=True,
+-                    weight_norm=True,
+-                ),
+-                Conv1d(
+-                    in_channels=channels,
+-                    out_channels=channels,
+-                    kernel_size=kernel_size,
+-                    stride=1,
+-                    dilation=dilation[1],
+-                    padding="same",
+-                    skip_transpose=True,
+-                    weight_norm=True,
+-                ),
+-                Conv1d(
+-                    in_channels=channels,
+-                    out_channels=channels,
+-                    kernel_size=kernel_size,
+-                    stride=1,
+-                    dilation=dilation[2],
+-                    padding="same",
+-                    skip_transpose=True,
+-                    weight_norm=True,
+-                ),
+-            ]
++        self.inference_padding = inference_padding
++        self.num_kernels = len(resblock_kernel_sizes)
++        self.num_upsamples = len(upsample_factors)
++        # initial upsampling layers
++        self.conv_pre = Conv1d(
++            in_channels=in_channels,
++            out_channels=upsample_initial_channel,
++            kernel_size=7,
++            stride=1,
++            padding="same",
++            skip_transpose=True,
++            weight_norm=True,
+         )
+-
+-        self.convs2 = nn.ModuleList(
+-            [
+-                Conv1d(
+-                    in_channels=channels,
+-                    out_channels=channels,
+-                    kernel_size=kernel_size,
+-                    stride=1,
+-                    dilation=1,
+-                    padding="same",
++        resblock = ResBlock1 if resblock_type == "1" else ResBlock2
++        # upsampling layers
++        self.ups = nn.ModuleList()
++        self.mambas = nn.ModuleList()
++        for i, (u, k) in enumerate(
++            zip(upsample_factors, upsample_kernel_sizes)
++        ):
++            self.ups.append(
++                ConvTranspose1d(
++                    in_channels=upsample_initial_channel // (2**i),
++                    out_channels=upsample_initial_channel // (2 ** (i + 1)),
++                    kernel_size=k,
++                    stride=u,
++                    padding=(k - u) // 2,
+                     skip_transpose=True,
+                     weight_norm=True,
+-                ),
+-                Conv1d(
+-                    in_channels=channels,
+-                    out_channels=channels,
+-                    kernel_size=kernel_size,
+-                    stride=1,
+-                    dilation=1,
+-                    padding="same",
+-                    skip_transpose=True,
+-                    weight_norm=True,
+-                ),
+-                Conv1d(
+-                    in_channels=channels,
+-                    out_channels=channels,
+-                    kernel_size=kernel_size,
+-                    stride=1,
+-                    dilation=1,
+-                    padding="same",
+-                    skip_transpose=True,
+-                    weight_norm=True,
+-                ),
+-            ]
++                )
++            )
++        # MRF blocks
++        self.resblocks = nn.ModuleList()
++        for i in range(len(self.ups)):
++            ch = upsample_initial_channel // (2 ** (i + 1))
++            self.mambas.append(BiMamba2Block(channels=ch, d_state=128))
++            for _, (k, d) in enumerate(
++                zip(resblock_kernel_sizes, resblock_dilation_sizes)
++            ):
++                self.resblocks.append(resblock(ch, k, d))
++        # post convolution layer
++        self.conv_post = Conv1d(
++            in_channels=ch,
++            out_channels=1,
++            kernel_size=7,
++            stride=1,
++            padding="same",
++            skip_transpose=True,
++            bias=conv_post_bias,
++            weight_norm=True,
+         )
++        if cond_channels > 0:
++            self.cond_layer = Conv1d(
++                in_channels=cond_channels,
++                out_channels=upsample_initial_channel,
++                kernel_size=1,
++            )
+ 
+-    def forward(self, x):
+-        """Returns the output of ResBlock1
+-
++    def forward(self, x, g=None):
++        """
+         Arguments
+         ---------
+         x : torch.Tensor (batch, channel, time)
+-            input tensor.
++            feature input tensor.
++        g : torch.Tensor (batch, 1, time)
++            global conditioning input tensor.
+ 
+         Returns
+         -------
+-        The ResBlock outputs
++        The generator outputs
+         """
+ 
+-        for c1, c2 in zip(self.convs1, self.convs2):
+-            xt = F.leaky_relu(x, LRELU_SLOPE)
+-            xt = c1(xt)
+-            xt = F.leaky_relu(xt, LRELU_SLOPE)
+-            xt = c2(xt)
+-            x = xt + x
+-        return x
++        o = self.conv_pre(x)
++        if hasattr(self, "cond_layer"):
++            o = o + self.cond_layer(g)
++        for i in range(self.num_upsamples):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            o = self.ups[i](o)
++            z_sum = None
++            for j in range(self.num_kernels):
++                if z_sum is None:
++                    z_sum = self.resblocks[i * self.num_kernels + j](o)
++                else:
++                    z_sum += self.resblocks[i * self.num_kernels + j](o)
++            # Add Mamba branch
++            z_sum += self.mambas[i](o)
++            o = z_sum / (self.num_kernels + 1)
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        o = torch.tanh(o)
++        return o
+ 
+     def remove_weight_norm(self):
+         """This functions removes weight normalization during inference."""
+-        for layer in self.convs1:
++
++        for layer in self.ups:
+             layer.remove_weight_norm()
+-        for layer in self.convs2:
++        for layer in self.resblocks:
+             layer.remove_weight_norm()
++        for layer in self.mambas:
++            if hasattr(layer, "remove_weight_norm"):
++                layer.remove_weight_norm()
++        self.conv_pre.remove_weight_norm()
++        self.conv_post.remove_weight_norm()
+ 
++    @torch.no_grad()
++    def inference(self, c, padding=True):
++        """The inference function performs a padding and runs the forward method.
+ 
+-class ResBlock2(torch.nn.Module):
+-    """
+-    Residual Block Type 2, which has 2 convolutional layers in each convolution block.
++        Arguments
++        ---------
++        c : torch.Tensor (batch, channel, time)
++            feature input tensor.
++        padding : bool
++            Whether to pad tensor before forward.
+ 
++        Returns
++        -------
++        The generator outputs
++        """
++        if padding:
++            c = torch.nn.functional.pad(
++                c, (self.inference_padding, self.inference_padding), "replicate"
++            )
++        return self.forward(c)
++
++
++class HifiganGeneratorHybrid1GatedFusion(torch.nn.Module):
++    """HiFiGAN Generator with Multi-Receptive Field Fusion (MRF)
++    Hybrid 1 + Gated Fusion
++
+     Arguments
+     ---------
+-    channels : int
+-        number of hidden channels for the convolutional layers.
+-    kernel_size : int
+-        size of the convolution filter in each layer.
+-    dilation : list
+-        list of dilation value for each conv layer in a block.
++    in_channels : int
++        number of input tensor channels.
++    out_channels : int
++        number of output tensor channels.
++    resblock_type : str
++        type of the `ResBlock`. '1' or '2'.
++    resblock_dilation_sizes : List[List[int]]
++        list of dilation values in each layer of a `ResBlock`.
++    resblock_kernel_sizes : List[int]
++        list of kernel sizes for each `ResBlock`.
++    upsample_kernel_sizes : List[int]
++        list of kernel sizes for each transposed convolution.
++    upsample_initial_channel : int
++        number of channels for the first upsampling layer. This is divided by 2
++        for each consecutive upsampling layer.
++    upsample_factors : List[int]
++        upsampling factors (stride) for each upsampling layer.
++    inference_padding : int
++       constant padding applied to the input at inference time. Defaults to 5.
++    cond_channels : int
++        If provided, adds a conv layer to the beginning of the forward.
++    conv_post_bias : bool
++        Whether to add a bias term to the final conv.
+     """
+ 
+-    def __init__(self, channels, kernel_size=3, dilation=(1, 3)):
++    def __init__(
++        self,
++        in_channels,
++        out_channels,
++        resblock_type,
++        resblock_dilation_sizes,
++        resblock_kernel_sizes,
++        upsample_kernel_sizes,
++        upsample_initial_channel,
++        upsample_factors,
++        inference_padding=5,
++        cond_channels=0,
++        conv_post_bias=True,
++    ):
+         super().__init__()
+-        self.convs = nn.ModuleList(
+-            [
+-                Conv1d(
+-                    in_channels=channels,
+-                    out_channels=channels,
+-                    kernel_size=kernel_size,
+-                    stride=1,
+-                    dilation=dilation[0],
+-                    padding="same",
++        self.inference_padding = inference_padding
++        self.num_kernels = len(resblock_kernel_sizes)
++        self.num_upsamples = len(upsample_factors)
++        # initial upsampling layers
++        self.conv_pre = Conv1d(
++            in_channels=in_channels,
++            out_channels=upsample_initial_channel,
++            kernel_size=7,
++            stride=1,
++            padding="same",
++            skip_transpose=True,
++            weight_norm=True,
++        )
++        resblock = ResBlock1 if resblock_type == "1" else ResBlock2
++        # upsampling layers
++        self.ups = nn.ModuleList()
++        self.mambas = nn.ModuleList()
++        
++        # --- NEW: Gating Parameters ---
++        # Initialize with 0.0 so sigmoid(0.0) = 0.5 (equal weight to start)
++        self.mixing_gates = nn.ParameterList()
++
++        for i, (u, k) in enumerate(
++            zip(upsample_factors, upsample_kernel_sizes)
++        ):
++            self.ups.append(
++                ConvTranspose1d(
++                    in_channels=upsample_initial_channel // (2**i),
++                    out_channels=upsample_initial_channel // (2 ** (i + 1)),
++                    kernel_size=k,
++                    stride=u,
++                    padding=(k - u) // 2,
+                     skip_transpose=True,
+                     weight_norm=True,
+-                ),
+-                Conv1d(
+-                    in_channels=channels,
+-                    out_channels=channels,
+-                    kernel_size=kernel_size,
+-                    stride=1,
+-                    dilation=dilation[1],
+-                    padding="same",
+-                    skip_transpose=True,
+-                    weight_norm=True,
+-                ),
+-            ]
++                )
++            )
++            # Add a learnable scalar for this layer
++            self.mixing_gates.append(nn.Parameter(torch.zeros(1)))
++
++        # MRF blocks
++        self.resblocks = nn.ModuleList()
++        for i in range(len(self.ups)):
++            ch = upsample_initial_channel // (2 ** (i + 1))
++            self.mambas.append(BiMamba2Block(channels=ch, d_state=128))
++            for _, (k, d) in enumerate(
++                zip(resblock_kernel_sizes, resblock_dilation_sizes)
++            ):
++                self.resblocks.append(resblock(ch, k, d))
++        # post convolution layer
++        self.conv_post = Conv1d(
++            in_channels=ch,
++            out_channels=1,
++            kernel_size=7,
++            stride=1,
++            padding="same",
++            skip_transpose=True,
++            bias=conv_post_bias,
++            weight_norm=True,
+         )
++        if cond_channels > 0:
++            self.cond_layer = Conv1d(
++                in_channels=cond_channels,
++                out_channels=upsample_initial_channel,
++                kernel_size=1,
++            )
+ 
+-    def forward(self, x):
+-        """Returns the output of ResBlock1
+-
++    def forward(self, x, g=None):
++        """
+         Arguments
+         ---------
+         x : torch.Tensor (batch, channel, time)
+-            input tensor.
++            feature input tensor.
++        g : torch.Tensor (batch, 1, time)
++            global conditioning input tensor.
+ 
+         Returns
+         -------
+-        The ResBlock outputs
++        The generator outputs
+         """
+ 
+-        for c in self.convs:
+-            xt = F.leaky_relu(x, LRELU_SLOPE)
+-            xt = c(xt)
+-            x = xt + x
+-        return x
++        o = self.conv_pre(x)
++        if hasattr(self, "cond_layer"):
++            o = o + self.cond_layer(g)
++        for i in range(self.num_upsamples):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            o = self.ups[i](o)
++            
++            # --- GATED FUSION START ---
++            
++            # 1. Calculate Convolutional Branch (Texture)
++            conv_sum = None
++            for j in range(self.num_kernels):
++                res_out = self.resblocks[i * self.num_kernels + j](o)
++                if conv_sum is None:
++                    conv_sum = res_out
++                else:
++                    conv_sum += res_out
++            
++            # Average the Conv outputs
++            conv_out = conv_sum / self.num_kernels
++
++            # 2. Calculate Mamba Branch (Global Context)
++            mamba_out = self.mambas[i](o)
++
++            # 3. Dynamic Mixing
++            # Calculate alpha (0 to 1)
++            alpha = torch.sigmoid(self.mixing_gates[i])
++            
++            # Fuse: alpha controls how much we trust Mamba vs Conv
++            # If alpha is high -> Trust Mamba more
++            # If alpha is low  -> Trust Conv more
++            o = (alpha * mamba_out) + ((1 - alpha) * conv_out)
++            
++            # --- GATED FUSION END ---
+ 
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        o = torch.tanh(o)
++        return o
++
+     def remove_weight_norm(self):
+         """This functions removes weight normalization during inference."""
+-        for layer in self.convs:
++
++        for layer in self.ups:
+             layer.remove_weight_norm()
++        for layer in self.resblocks:
++            layer.remove_weight_norm()
++        for layer in self.mambas:
++            if hasattr(layer, "remove_weight_norm"):
++                layer.remove_weight_norm()
++        self.conv_pre.remove_weight_norm()
++        self.conv_post.remove_weight_norm()
+ 
++    @torch.no_grad()
++    def inference(self, c, padding=True):
++        """The inference function performs a padding and runs the forward method.
+ 
+-class HifiganGenerator(torch.nn.Module):
++        Arguments
++        ---------
++        c : torch.Tensor (batch, channel, time)
++            feature input tensor.
++        padding : bool
++            Whether to pad tensor before forward.
++
++        Returns
++        -------
++        The generator outputs
++        """
++        if padding:
++            c = torch.nn.functional.pad(
++                c, (self.inference_padding, self.inference_padding), "replicate"
++            )
++        return self.forward(c)
++
++
++
++class OriginalHifiganGenerator(torch.nn.Module):
+     """HiFiGAN Generator with Multi-Receptive Field Fusion (MRF)
+ 
+     Arguments
+@@ -549,7 +3492,331 @@
+             )
+         return self.forward(c)
+ 
++class MambaOnlyHifiganGenerator(torch.nn.Module):
++    """HiFiGAN Generator with Mamba blocks replacing the MRF module.
+ 
++    Arguments
++    ---------
++    in_channels : int
++        number of input tensor channels.
++    out_channels : int
++        number of output tensor channels.
++    resblock_type : str
++        Unused, kept for backward compatibility with original HiFiGAN config.
++    resblock_dilation_sizes : List[List[int]]
++        Unused, kept for backward compatibility with original HiFiGAN config.
++    resblock_kernel_sizes : List[int]
++        Unused, kept for backward compatibility with original HiFiGAN config.
++    upsample_kernel_sizes : List[int]
++        list of kernel sizes for each transposed convolution.
++    upsample_initial_channel : int
++        number of channels for the first upsampling layer. This is divided by 2
++        for each consecutive upsampling layer.
++    upsample_factors : List[int]
++        upsampling factors (stride) for each upsampling layer.
++    inference_padding : int
++       constant padding applied to the input at inference time. Defaults to 5.
++    cond_channels : int
++        If provided, adds a conv layer to the beginning of the forward.
++    conv_post_bias : bool
++        Whether to add a bias term to the final conv.
++    mamba_d_state : int
++        The state dimension for the Mamba blocks.
++    """
++
++    def __init__(
++        self,
++        in_channels,
++        out_channels,
++        resblock_type,  # unused, for YAML/API compatibility
++        resblock_dilation_sizes,  # unused, for YAML/API compatibility
++        resblock_kernel_sizes,  # unused, for YAML/API compatibility
++        upsample_kernel_sizes,
++        upsample_initial_channel,
++        upsample_factors,
++        inference_padding=5,
++        cond_channels=0,
++        conv_post_bias=True,
++        mamba_d_state=64,
++    ):
++        super().__init__()
++        self.inference_padding = inference_padding
++        self.num_upsamples = len(upsample_factors)
++
++        # Initial convolutional layer
++        self.conv_pre = Conv1d(
++            in_channels=in_channels,
++            out_channels=upsample_initial_channel,
++            kernel_size=7,
++            stride=1,
++            padding="same",
++            skip_transpose=True,
++            weight_norm=True,
++        )
++
++        # Upsampling and Mamba blocks
++        self.ups = nn.ModuleList()
++        self.mambas = nn.ModuleList()
++        for i, (u, k) in enumerate(
++            zip(upsample_factors, upsample_kernel_sizes)
++        ):
++            in_ch = upsample_initial_channel // (2**i)
++            out_ch = upsample_initial_channel // (2 ** (i + 1))
++            self.ups.append(
++                ConvTranspose1d(
++                    in_channels=in_ch,
++                    out_channels=out_ch,
++                    kernel_size=k,
++                    stride=u,
++                    padding=(k - u) // 2,
++                    skip_transpose=True,
++                    weight_norm=True,
++                )
++            )
++            self.mambas.append(BiMamba2Block(channels=out_ch, d_state=mamba_d_state))
++
++        # Final convolutional layer
++        self.conv_post = Conv1d(
++            in_channels=out_ch,
++            out_channels=1,
++            kernel_size=7,
++            stride=1,
++            padding="same",
++            skip_transpose=True,
++            bias=conv_post_bias,
++            weight_norm=True,
++        )
++
++        # Conditional layer
++        if cond_channels > 0:
++            self.cond_layer = Conv1d(
++                in_channels=cond_channels,
++                out_channels=upsample_initial_channel,
++                kernel_size=1,
++            )
++
++    def forward(self, x, g=None):
++        """
++        Arguments
++        ---------
++        x : torch.Tensor (batch, channel, time)
++            feature input tensor.
++        g : torch.Tensor (batch, 1, time)
++            global conditioning input tensor.
++
++        Returns
++        -------
++        The generator outputs
++        """
++        o = self.conv_pre(x)
++        if hasattr(self, "cond_layer"):
++            o = o + self.cond_layer(g)
++
++        for i in range(self.num_upsamples):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            o = self.ups[i](o)
++            o = self.mambas[i](o)
++
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        o = torch.tanh(o)
++        return o
++
++    def remove_weight_norm(self):
++        """This functions removes weight normalization during inference."""
++        for layer in self.ups:
++            layer.remove_weight_norm()
++        for layer in self.mambas:
++            if hasattr(layer, "remove_weight_norm"):
++                layer.remove_weight_norm()
++        self.conv_pre.remove_weight_norm()
++        self.conv_post.remove_weight_norm()
++
++    @torch.no_grad()
++    def inference(self, c, padding=True):
++        """The inference function performs a padding and runs the forward method."""
++        if padding:
++            c = torch.nn.functional.pad(
++                c, (self.inference_padding, self.inference_padding), "replicate"
++            )
++        return self.forward(c)
++        
++class HybridHifiganGenerator2(torch.nn.Module):
++    """HiFiGAN Generator with Multi-Receptive Field Fusion (MRF) and Mamba in parallel.
++    This version explicitly adds a Mamba branch to the full MRF (3 residual blocks).
++
++    Arguments
++    ---------
++    in_channels : int
++        number of input tensor channels.
++    out_channels : int
++        number of output tensor channels.
++    resblock_type : str
++        type of the `ResBlock`. '1' or '2'.
++    resblock_dilation_sizes : List[List[int]]
++        list of dilation values in each layer of a `ResBlock`.
++    resblock_kernel_sizes : List[int]
++        list of kernel sizes for each `ResBlock`.
++    upsample_kernel_sizes : List[int]
++        list of kernel sizes for each transposed convolution.
++    upsample_initial_channel : int
++        number of channels for the first upsampling layer. This is divided by 2
++        for each consecutive upsampling layer.
++    upsample_factors : List[int]
++        upsampling factors (stride) for each upsampling layer.
++    inference_padding : int
++       constant padding applied to the input at inference time. Defaults to 5.
++    cond_channels : int
++        If provided, adds a conv layer to the beginning of the forward.
++    conv_post_bias : bool
++        Whether to add a bias term to the final conv.
++    mamba_d_state : int
++        The state dimension for the Mamba blocks.
++    """
++
++    def __init__(
++        self,
++        in_channels,
++        out_channels,
++        resblock_type,
++        resblock_dilation_sizes,
++        resblock_kernel_sizes,
++        upsample_kernel_sizes,
++        upsample_initial_channel,
++        upsample_factors,
++        inference_padding=5,
++        cond_channels=0,
++        conv_post_bias=True,
++        mamba_d_state=64,
++    ):
++        super().__init__()
++        self.inference_padding = inference_padding
++        self.num_kernels = len(resblock_kernel_sizes)
++        self.num_upsamples = len(upsample_factors)
++        # initial upsampling layers
++        self.conv_pre = Conv1d(
++            in_channels=in_channels,
++            out_channels=upsample_initial_channel,
++            kernel_size=7,
++            stride=1,
++            padding="same",
++            skip_transpose=True,
++            weight_norm=True,
++        )
++        resblock = ResBlock1 if resblock_type == "1" else ResBlock2
++        # upsampling layers
++        self.ups = nn.ModuleList()
++        self.mambas = nn.ModuleList()
++        for i, (u, k) in enumerate(
++            zip(upsample_factors, upsample_kernel_sizes)
++        ):
++            self.ups.append(
++                ConvTranspose1d(
++                    in_channels=upsample_initial_channel // (2**i),
++                    out_channels=upsample_initial_channel // (2 ** (i + 1)),
++                    kernel_size=k,
++                    stride=u,
++                    padding=(k - u) // 2,
++                    skip_transpose=True,
++                    weight_norm=True,
++                )
++            )
++        # MRF blocks
++        self.resblocks = nn.ModuleList()
++        for i in range(len(self.ups)):
++            ch = upsample_initial_channel // (2 ** (i + 1))
++            self.mambas.append(BiMamba2Block(channels=ch, d_state=mamba_d_state))
++            for _, (k, d) in enumerate(
++                zip(resblock_kernel_sizes, resblock_dilation_sizes)
++            ):
++                self.resblocks.append(resblock(ch, k, d))
++        # post convolution layer
++        self.conv_post = Conv1d(
++            in_channels=ch,
++            out_channels=1,
++            kernel_size=7,
++            stride=1,
++            padding="same",
++            skip_transpose=True,
++            bias=conv_post_bias,
++            weight_norm=True,
++        )
++        if cond_channels > 0:
++            self.cond_layer = Conv1d(
++                in_channels=cond_channels,
++                out_channels=upsample_initial_channel,
++                kernel_size=1,
++            )
++
++    def forward(self, x, g=None):
++        """
++        Arguments
++        ---------
++        x : torch.Tensor (batch, channel, time)
++            feature input tensor.
++        g : torch.Tensor (batch, 1, time)
++            global conditioning input tensor.
++
++        Returns
++        -------
++        The generator outputs
++        """
++
++        o = self.conv_pre(x)
++        if hasattr(self, "cond_layer"):
++            o = o + self.cond_layer(g)
++        for i in range(self.num_upsamples):
++            o = F.leaky_relu(o, LRELU_SLOPE)
++            o = self.ups[i](o)
++            z_sum = None
++            for j in range(self.num_kernels):
++                if z_sum is None:
++                    z_sum = self.resblocks[i * self.num_kernels + j](o)
++                else:
++                    z_sum += self.resblocks[i * self.num_kernels + j](o)
++            # Add Mamba branch
++            z_sum += self.mambas[i](o)
++            o = z_sum / (self.num_kernels + 1)
++        o = F.leaky_relu(o)
++        o = self.conv_post(o)
++        o = torch.tanh(o)
++        return o
++
++    def remove_weight_norm(self):
++        """This functions removes weight normalization during inference."""
++
++        for layer in self.ups:
++            layer.remove_weight_norm()
++        for layer in self.resblocks:
++            layer.remove_weight_norm()
++        for layer in self.mambas:
++            if hasattr(layer, "remove_weight_norm"):
++                layer.remove_weight_norm()
++        self.conv_pre.remove_weight_norm()
++        self.conv_post.remove_weight_norm()
++
++    @torch.no_grad()
++    def inference(self, c, padding=True):
++        """The inference function performs a padding and runs the forward method.
++
++        Arguments
++        ---------
++        c : torch.Tensor (batch, channel, time)
++            feature input tensor.
++        padding : bool
++            Whether to pad tensor before forward.
++
++        Returns
++        -------
++        The generator outputs
++        """
++        if padding:
++            c = torch.nn.functional.pad(
++                c, (self.inference_padding, self.inference_padding), "replicate"
++            )
++        return self.forward(c)
++
++
+ class VariancePredictor(nn.Module):
+     """Variance predictor inspired from FastSpeech2
+ 
+@@ -1836,3 +5103,4 @@
+ 
+         loss["D_loss"] = disc_loss
+         return loss
++
+--- a/recipes/LJSpeech/TTS/vocoder/hifigan/train.py
++++ b/recipes/LJSpeech/TTS/vocoder/hifigan/train.py
+@@ -20,6 +20,7 @@
+ import speechbrain as sb
+ from speechbrain.dataio import audio_io
+ from speechbrain.utils.data_utils import scalarize
++from speechbrain.utils.train_logger import plot_spectrogram
+ 
+ 
+ class HifiGanBrain(sb.Brain):
+@@ -198,6 +199,12 @@
+                     train_stats=self.last_loss_stats[sb.Stage.TRAIN],
+                     valid_stats=self.last_loss_stats[sb.Stage.VALID],
+                 )
++            if getattr(self.hparams, "use_wandb", False):
++                self.wandb_logger.log_stats(
++                    stats_meta={"Epoch": epoch, "lr_g": lr_g, "lr_d": lr_d},
++                    train_stats=self.last_loss_stats[sb.Stage.TRAIN],
++                    valid_stats=self.last_loss_stats[sb.Stage.VALID],
++                )
+ 
+             # Save the current checkpoint and delete previous checkpoints.
+             epoch_metadata = {
+@@ -231,6 +238,11 @@
+             )
+             if self.hparams.use_tensorboard:
+                 self.tensorboard_logger.log_stats(
++                    {"Epoch loaded": self.hparams.epoch_counter.current},
++                    test_stats=self.last_loss_stats[sb.Stage.TEST],
++                )
++            if getattr(self.hparams, "use_wandb", False):
++                self.wandb_logger.log_stats(
+                     {"Epoch loaded": self.hparams.epoch_counter.current},
+                     test_stats=self.last_loss_stats[sb.Stage.TEST],
+                 )
+@@ -263,7 +275,38 @@
+             )
+             self.tensorboard_logger.log_figure(f"{name}/mel_target", x)
+             self.tensorboard_logger.log_figure(f"{name}/mel_pred", spec_out)
+-        else:
++        if getattr(self.hparams, "use_wandb", False) and hasattr(self, "wandb_logger") and self.wandb_logger.run is not None:
++            import wandb
++            
++            # Log audio
++            self.wandb_logger.run.log(
++                {
++                    f"{name}/audio_target": wandb.Audio(
++                        y.squeeze(0).cpu().numpy(),
++                        sample_rate=self.hparams.sample_rate,
++                    ),
++                    f"{name}/audio_pred": wandb.Audio(
++                        sig_out.squeeze(0).cpu().numpy(),
++                        sample_rate=self.hparams.sample_rate,
++                    ),
++                },
++                step=self.hparams.epoch_counter.current,
++            )
++            
++            # Log spectrograms
++            fig_target = plot_spectrogram(x)
++            fig_pred = plot_spectrogram(spec_out)
++            if fig_target is not None:
++                self.wandb_logger.run.log(
++                    {f"{name}/mel_target": wandb.Image(fig_target)},
++                    step=self.hparams.epoch_counter.current,
++                )
++            if fig_pred is not None:
++                self.wandb_logger.run.log(
++                    {f"{name}/mel_pred": wandb.Image(fig_pred)},
++                    step=self.hparams.epoch_counter.current,
++                )
++        if not self.hparams.use_tensorboard and not getattr(self.hparams, "use_wandb", False):
+             # folder name is the current epoch for validation and "test" for test
+             folder = (
+                 self.hparams.epoch_counter.current
+@@ -337,6 +380,11 @@
+             output_keys=["id", "mel", "sig"],
+         )
+ 
++        if hparams.get("min_duration") and dataset == "train":
++            datasets[dataset] = datasets[dataset].filtered_sorted(
++                key_min_value={"duration": hparams["min_duration"]}
++            )
++
+     return datasets
+ 
+ 
+@@ -393,6 +441,22 @@
+                 save_dir=hparams["output_folder"] + "/tensorboard"
+             )
+         )
++    
++    if hparams.get("use_wandb", False):
++        import wandb
++        from speechbrain.utils.train_logger import WandBLogger
++        
++        wandb_init_kwargs = hparams.get("wandb_init_kwargs", {})
++        if "dir" not in wandb_init_kwargs:
++            wandb_dir = hparams["output_folder"] + "/wandb"
++            if not os.path.exists(wandb_dir):
++                os.makedirs(wandb_dir)
++            wandb_init_kwargs["dir"] = wandb_dir
++        
++        hifi_gan_brain.wandb_logger = WandBLogger(
++            initializer=wandb.init,
++            **wandb_init_kwargs
++        )
+ 
+     # Training
+     hifi_gan_brain.fit(
