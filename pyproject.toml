@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mamba-hifigan"
+version = "1.0.0"
+description = "Bidirectional Mamba in the HiFi-GAN generator: nineteen placements, and the one that helped"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+authors = [
+  {name = "Hüseyin Karaca"},
+  {name = "Rabia Ela Ünlü"},
+  {name = "Emre Can Yayla"},
+]
+keywords = ["speech-synthesis", "vocoder", "hifi-gan", "mamba", "state-space-models"]
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "torch>=2.0",
+  "speechbrain>=1.0",
+]
+
+# mamba-ssm and causal-conv1d need a CUDA toolchain to build, so they are not installed automatically.
+# Install them separately:  pip install mamba-ssm "causal-conv1d>=1.2.0"
+[project.optional-dependencies]
+docs = ["mkdocs-material>=9.5"]
+
+[project.urls]
+Homepage = "https://hkaraca.com/mamba-hifigan/"
+Repository = "https://github.com/huseyin-karaca/mamba-hifigan"
+
+[tool.setuptools.packages.find]
+where = ["src"]

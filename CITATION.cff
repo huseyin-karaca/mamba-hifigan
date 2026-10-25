@@ -1,0 +1,36 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite it as below."
+title: "Mamba HiFi-GAN: adaptive gated fusion of convolutional and bidirectional-SSM branches in a neural vocoder"
+type: software
+license: Apache-2.0
+repository-code: "https://github.com/huseyin-karaca/mamba-hifigan"
+url: "https://hkaraca.com/mamba-hifigan/"
+authors:
+  - family-names: Karaca
+    given-names: Hüseyin
+    affiliation: Bilkent University
+  - family-names: Ünlü
+    given-names: "Rabia Ela"
+    affiliation: Bilkent University
+  - family-names: Yayla
+    given-names: "Emre Can"
+    affiliation: Bilkent University
+keywords:
+  - speech synthesis
+  - neural vocoder
+  - HiFi-GAN
+  - state space models
+  - Mamba
+preferred-citation:
+  type: generic
+  title: "Integrating Bidirectional Mamba into HiFi-GAN for Long-Range Speech Synthesis"
+  authors:
+    - family-names: Karaca
+      given-names: Hüseyin
+    - family-names: Ünlü
+      given-names: "Rabia Ela"
+    - family-names: Yayla
+      given-names: "Emre Can"
+  year: 2025
+  notes: "CS 585 term project, Bilkent University"
+  url: "https://hkaraca.com/mamba-hifigan/"
