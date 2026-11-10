@@ -1,0 +1,18 @@
+{
+ "fail": [],
+ "warn": [
+  "width 160 mm is not a Nature column width (89, 120, 136, 183)",
+  "more than one font family: 'Schibsted Grotesk', Arial, sans-serif | 'Latin Modern Roman', 'Latin Modern Math', serif",
+  "text above 8 pt: \"BiMamba\", \"MRF\", \"𝑥\", \"𝛼𝑖\", \"1 − 𝛼𝑖\", \"𝛼𝑖 = 𝜎(𝑤𝑖)\"",
+  "text over busy art (use a halo, move it, or add a leader line): \"LN\" 0.06, \"11\" 0.09, \"7\" 0.18, \"3\" 0.18, \"mean\" 0.07"
+ ],
+ "info": [
+  "build 183 ms; 160 x 111.5 mm; 43 texts, 149 strokes, 0 images, 0 panels",
+  "median label 7.499999999999999 pt = 1.65% of the width (published Fig. 1s: median 2.2%, 25th percentile 1.65%)",
+  "text: 51 words, 0.29 words/cm2 (calibration from 5 published schematics: 0.20-0.45)",
+  "coloured text (fine when the hue is the colour of the entity it names, P15; never for emphasis alone): \"Text\", \"Acoustic model\", \"Mel spectrogram\", \"HiFi-GAN generator\", \"Waveform\", \"e.g. FastSpeech 2\", \"↑8\", \"𝛼1\"",
+  "no relations declared (F.relate): the connectivity check is off",
+  "ink coverage 13.0% of the page (calibration: see reference/style.md)",
+  "largest empty square per panel (share of panel area): "
+ ]
+}
