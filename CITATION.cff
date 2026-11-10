@@ -1,6 +1,6 @@
 cff-version: 1.2.0
-message: "If you use this code, please cite it as below."
-title: "Mamba HiFi-GAN: adaptive gated fusion of convolutional and bidirectional-SSM branches in a neural vocoder"
+message: "If you use this code, please cite the report below."
+title: "Mamba HiFi-GAN: Integrating Bidirectional Mamba into HiFi-GAN for Long-Range Speech Synthesis"
 type: software
 license: Apache-2.0
 repository-code: "https://github.com/huseyin-karaca/mamba-hifigan"

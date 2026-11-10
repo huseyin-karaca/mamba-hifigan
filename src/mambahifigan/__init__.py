@@ -18,8 +18,8 @@ The modules are grouped the way the study grouped them -- by what goes wrong, no
     bottleneck   integrations that compress or interpolate away information
     partial      Mamba at some resolutions only
 
-`EXPERIMENTS` lists every run that was logged, with the class it used and its final-epoch losses; the same table is
-in `results/experiments.csv`, which is what the documentation site is built from.
+`load_experiments()` reads `results/experiments.csv`: every logged run, with the class it used and its final-epoch
+losses.
 """
 
 from .baseline import OriginalHifiganGenerator

@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mamba HiFi-GAN: Integrating Bidirectional Mamba into HiFi-GAN for Long-Range Speech Synthesis</title>
+<meta name="description" content="Bilkent University CS585 Course Project (Fall 2025-26)">
+<meta property="og:image" content="https://hkaraca.com/mamba-hifigan/assets/teaser.png">
+<meta name="citation_title" content="Integrating Bidirectional Mamba into HiFi-GAN for Long-Range Speech Synthesis">
+<meta name="citation_author" content="Karaca, Huseyin">
+<meta name="citation_author" content="Unlu, Rabia Ela">
+<meta name="citation_author" content="Yayla, Emre Can">
+<meta name="citation_publication_date" content="2025">
+<meta name="citation_technical_report_institution" content="Bilkent University">
+<meta name="citation_pdf_url" content="https://hkaraca.com/mamba-hifigan/assets/report.pdf">
+<meta name="citation_abstract_html_url" content="https://hkaraca.com/mamba-hifigan/">
+<link rel="icon" href="assets/favicon.svg">
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+<style>
+:root{--bg:#fff;--ink:#1c2230;--ink2:#434a5a;--muted:#6b7180;--faint:#9ba1ad;--line:#c9ccd3;--wash:#f6f7f9;--accent:#3355d6;--tint:#eef1fc;--on-accent:#fff}
+@media (prefers-color-scheme:dark){:root{--bg:#171a21;--ink:#e7e9ee;--ink2:#c2c7d1;--muted:#9aa0ad;--faint:#6d7484;--line:#3b414d;--wash:#1c2028;--accent:#5b78ee;--tint:#232c4d;--on-accent:#fff}}
+*{box-sizing:border-box}
+main{text-align:center}
+body{margin:0;background:var(--bg);color:var(--ink);font:17px/1.6 system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
+main{max-width:760px;margin:0 auto;padding:56px 20px 80px}
+header{text-align:center;margin-bottom:32px}
+.venue{color:var(--muted);font-size:14px;margin:0 0 8px}
+h1{font-size:40px;line-height:1.1;margin:0}
+.title{font-size:20px;color:var(--ink2);margin:6px 0 16px}
+.authors{margin:0}.affil{color:var(--muted);margin:0 0 20px}
+.links a{display:inline-flex;align-items:center;gap:8px;margin:4px;padding:6px 16px;border:1px solid var(--line);border-radius:999px;color:var(--ink);text-decoration:none}
+.links a:hover{border-color:var(--ink)}
+h2{font-size:24px;margin:48px 0 12px}h3{font-size:18px;margin:28px 0 8px}
+a{color:var(--accent)}
+figure{margin:20px 0}figure svg,figure img{width:100%;height:auto;display:block}figure img{border-radius:8px}
+figcaption{color:var(--muted);font-size:15px;margin-top:8px}
+table{width:100%;border-collapse:collapse;font-size:15px;font-variant-numeric:tabular-nums}
+th,td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:right}th:first-child,td:first-child{text-align:left}
+tr.ours td{font-weight:600;background:var(--tint)}
+.tall{display:none}@media (max-width:600px){.wide{display:none}.tall{display:block}}
+audio{width:100%;height:36px}
+.f-ink{fill:var(--ink)}.s-ink{stroke:var(--ink)}.f-ink2{fill:var(--ink2)}.s-ink2{stroke:var(--ink2)}
+.f-muted{fill:var(--muted)}.s-muted{stroke:var(--muted)}.f-faint{fill:var(--faint)}.s-faint{stroke:var(--faint)}
+.f-line{fill:var(--line)}.s-line{stroke:var(--line)}.f-bg{fill:var(--bg)}.s-bg{stroke:var(--bg)}
+.f-accent{fill:var(--accent)}.s-accent{stroke:var(--accent)}.f-tint{fill:var(--tint)}.f-on-accent{fill:var(--on-accent)}
+</style>
+</head>
+<body><main>
+<header>
+  <p class="venue">Course project · CS 585, Bilkent · Fall 2025-26</p>
+  <h1>Mamba HiFi-GAN</h1>
+  <p class="title">Integrating Bidirectional Mamba into HiFi-GAN for Long-Range Speech Synthesis</p>
+  <p class="authors"><a href="https://hkaraca.com/">Hüseyin Karaca</a>, Rabia Ela Ünlü, Emre Can Yayla</p>
+  <p class="affil">Bilkent University</p>
+  <p class="links"><a href="assets/report.pdf"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/></svg>Paper</a><a href="https://github.com/huseyin-karaca/mamba-hifigan"><svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>Code</a><a href="assets/slides.pdf"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M12 16v4M8 20h8"/></svg>Slides</a></p>
+</header>
+
+<figure>
+<div class="wide"><img src="assets/teaser.png" width="1891" height="1353" alt="The TTS pipeline with the HiFi-GAN generator's four upsampling stages; inside one stage, a BiMamba branch and the MRF convolutions run on the same features and a learnable gate mixes them."></div>
+<div class="tall">
+<svg viewBox="0 0 360 330" role="img" aria-label="One upsampling stage: a BiMamba branch and the MRF convolutions run in parallel and are mixed by a learnable gate alpha i equals sigma of w i.">
+<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" class="f-muted"/></marker></defs>
+<text x="180" y="18" text-anchor="middle" class="f-muted" font-size="13">upsampled features, stage i</text>
+<path d="M180 26 V40 H90 V58" class="s-muted" stroke-width="1.5" fill="none" marker-end="url(#ar)"/><path d="M180 40 H270 V58" class="s-muted" stroke-width="1.5" fill="none" marker-end="url(#ar)"/>
+<rect x="14" y="60" width="152" height="64" rx="8" class="f-bg s-ink2" stroke-width="1.6"/>
+<text x="90" y="87" text-anchor="middle" class="f-ink" font-size="15" font-weight="700">BiMamba</text>
+<text x="90" y="109" text-anchor="middle" class="f-muted" font-size="13">global context</text>
+<rect x="194" y="60" width="152" height="64" rx="8" class="f-bg s-ink2" stroke-width="1.6"/>
+<text x="270" y="87" text-anchor="middle" class="f-ink" font-size="15" font-weight="700">MRF</text>
+<text x="270" y="109" text-anchor="middle" class="f-muted" font-size="13">local context</text>
+<path d="M90 124 V160" class="s-muted" stroke-width="1.5" fill="none" marker-end="url(#ar)"/><path d="M270 124 V160" class="s-muted" stroke-width="1.5" fill="none" marker-end="url(#ar)"/>
+<circle cx="90" cy="178" r="15" class="f-bg s-ink2" stroke-width="1.5"/><text x="90" y="183" text-anchor="middle" class="f-ink" font-size="15">×</text>
+<circle cx="270" cy="178" r="15" class="f-bg s-ink2" stroke-width="1.5"/><text x="270" y="183" text-anchor="middle" class="f-ink" font-size="15">×</text>
+<rect x="122" y="160" width="116" height="36" rx="18" class="f-tint s-accent" stroke-width="1.6"/>
+<text x="180" y="183" text-anchor="middle" class="f-accent" font-size="14" font-weight="600">α<tspan font-size="10" dy="3">i</tspan><tspan dy="-3"> = σ(w</tspan><tspan font-size="10" dy="3">i</tspan><tspan dy="-3">)</tspan></text>
+<path d="M122 178 H108 M238 178 H252" class="s-accent" stroke-width="1.4" stroke-dasharray="3 3" fill="none"/>
+<text x="90" y="218" text-anchor="middle" class="f-accent" font-size="13" font-weight="600">α<tspan font-size="10" dy="3">i</tspan></text>
+<text x="270" y="218" text-anchor="middle" class="f-accent" font-size="13" font-weight="600">1 − α<tspan font-size="10" dy="3">i</tspan></text>
+<text x="180" y="218" text-anchor="middle" class="f-muted" font-size="12">w<tspan font-size="9" dy="3">i</tspan><tspan dy="-3"> = 0 at init</tspan></text>
+<path d="M90 193 V200 M90 228 V268 H158 M270 193 V200 M270 228 V268 H202" class="s-muted" stroke-width="1.5" fill="none"/>
+<path d="M150 268 H160" class="s-muted" stroke-width="1.5" fill="none" marker-end="url(#ar)"/><path d="M210 268 H200" class="s-muted" stroke-width="1.5" fill="none" marker-end="url(#ar)"/>
+<circle cx="180" cy="268" r="18" class="f-accent"/><text x="180" y="274" text-anchor="middle" class="f-on-accent" font-size="18" font-weight="600">+</text>
+<path d="M180 286 V304" class="s-muted" stroke-width="1.5" fill="none" marker-end="url(#ar)"/>
+<text x="180" y="322" text-anchor="middle" class="f-muted" font-size="13">to stage i + 1</text>
+</svg>
+</div>
+<figcaption>At every upsampling stage, one learnable gate mixes a BiMamba branch with HiFi-GAN's MRF convolutions.</figcaption>
+</figure>
+
+<h2>Abstract</h2>
+<p>High-fidelity waveform generation requires modeling both fine-grained periodic texture and long-range prosodic structure. While HiFi-GAN achieves strong results through multi-receptive field dilated convolutions, its bounded receptive field limits global temporal modeling, potentially causing inconsistencies in longer utterances. To address this without the quadratic computational cost of Transformers, we integrate Mamba, a selective State Space Model (SSM) with linear complexity, into the HiFi-GAN generator. We introduce a Bidirectional Mamba block to capture global context in non-causal synthesis and evaluate multiple architectural configurations through a systematic ablation study. Our best hybrid architecture, which employs an adaptive gated fusion mechanism to dynamically balance convolutional texture modeling and SSM-based global structure, achieves a 15% improvement in perceptual quality (Feature Matching Loss) over the baseline while maintaining competitive spectral fidelity.</p>
+
+<h2 id="method">Method</h2>
+<p>Each upsampling stage runs the Bidirectional Mamba block beside the MRF module, on the same features. A learnable scalar <i>w<sub>i</sub></i> per stage mixes the two:</p>
+<p style="text-align:center;font-size:19px"><i>α<sub>i</sub></i> = σ(<i>w<sub>i</sub></i>), &nbsp; <i>y</i><sup>(<i>i</i>)</sup> = <i>α<sub>i</sub></i> Φ<sub>Mamba</sub> + (1 − <i>α<sub>i</sub></i>) Ψ<sub>CNN</sub></p>
+<p><i>w<sub>i</sub></i> starts at 0, an even split, and training sets the balance at each resolution.</p>
+
+<h2 id="results">Results</h2>
+<h3>15% lower feature-matching loss than HiFi-GAN</h3>
+<figure>
+<table>
+<thead><tr><th>Model</th><th>Feat. match ↓</th><th>L1 spec ↓</th></tr></thead>
+<tbody>
+<tr><td>Baseline (HiFi-GAN)</td><td>0.0736</td><td>0.2975</td></tr>
+<tr><td>Mamba Only (No Conv)</td><td>0.1291</td><td>0.3307</td></tr>
+<tr><td>Hybrid 2 (Summation Fusion)</td><td>0.0711</td><td>0.2991</td></tr>
+<tr class="ours"><td>Hybrid 1 (Mamba64 Gated)</td><td>0.0623</td><td>0.2806</td></tr>
+<tr class="ours"><td>Hybrid 1 (Mamba128 Gated)</td><td>0.0771</td><td>0.2587</td></tr>
+</tbody>
+</table>
+<figcaption>Mamba64 Gated gives the lowest feature-matching loss; Mamba128 Gated gives the lowest L1 loss, 13% below the baseline.</figcaption>
+</figure>
+
+<h3>Gated fusion leads all 11 alternative designs</h3>
+<figure>
+<!-- fig:designs -->
+<div class="wide">
+<svg viewBox="0 0 720 412" role="img" aria-label="Final feature-matching loss of thirteen generator designs, sorted. Hybrid 1 Gated has the lowest, 0.0623; the HiFi-GAN baseline is 0.0736.">
+<path d="M250.0 22 V368" class="s-line" stroke-width="1" fill="none"/>
+<text x="250.0" y="384" text-anchor="middle" class="f-muted" font-size="12">0.00</text>
+<path d="M350.0 22 V368" class="s-line" stroke-width="1" fill="none"/>
+<text x="350.0" y="384" text-anchor="middle" class="f-muted" font-size="12">0.05</text>
+<path d="M450.0 22 V368" class="s-line" stroke-width="1" fill="none"/>
+<text x="450.0" y="384" text-anchor="middle" class="f-muted" font-size="12">0.10</text>
+<path d="M550.0 22 V368" class="s-line" stroke-width="1" fill="none"/>
+<text x="550.0" y="384" text-anchor="middle" class="f-muted" font-size="12">0.15</text>
+<path d="M650.0 22 V368" class="s-line" stroke-width="1" fill="none"/>
+<text x="650.0" y="384" text-anchor="middle" class="f-muted" font-size="12">0.20</text>
+<text x="450.0" y="404" text-anchor="middle" class="f-muted" font-size="13">Feature matching loss ↓</text>
+<path d="M397.2 18 V368" class="s-ink2" stroke-width="1.5" stroke-dasharray="4 3" fill="none"/>
+<text x="240" y="44.0" text-anchor="end" class="f-ink" font-size="13" font-weight="600">Hybrid 1 Gated (Ours)</text>
+<path d="M250.0 32.0 H370.6 Q374.6 32.0 374.6 36.0 V42.0 Q374.6 46.0 370.6 46.0 H250.0 Z" class="f-accent"><title>Hybrid 1 Gated (Ours): 0.0623</title></path>
+<text x="380.6" y="44.5" class="f-ink s-bg" stroke-width="4" paint-order="stroke" font-size="12" font-weight="600">0.0623</text>
+<text x="240" y="70.0" text-anchor="end" class="f-ink2" font-size="13">Global Context Broadcasting</text>
+<path d="M250.0 58.0 H385.8 Q389.8 58.0 389.8 62.0 V68.0 Q389.8 72.0 385.8 72.0 H250.0 Z" class="f-faint"><title>Global Context Broadcasting: 0.0699</title></path>
+<text x="395.8" y="70.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">0.0699</text>
+<text x="240" y="96.0" text-anchor="end" class="f-ink" font-size="13">HiFi-GAN Baseline</text>
+<path d="M250.0 84.0 H393.2 Q397.2 84.0 397.2 88.0 V94.0 Q397.2 98.0 393.2 98.0 H250.0 Z" class="f-ink2"><title>HiFi-GAN Baseline: 0.0736</title></path>
+<text x="403.2" y="96.5" class="f-ink s-bg" stroke-width="4" paint-order="stroke" font-size="12">0.0736</text>
+<text x="240" y="122.0" text-anchor="end" class="f-ink2" font-size="13">Dual-Path Decoupled</text>
+<path d="M250.0 110.0 H417.4 Q421.4 110.0 421.4 114.0 V120.0 Q421.4 124.0 417.4 124.0 H250.0 Z" class="f-faint"><title>Dual-Path Decoupled: 0.0857</title></path>
+<text x="427.4" y="122.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">0.0857</text>
+<text x="240" y="148.0" text-anchor="end" class="f-ink2" font-size="13">FiLM Modulation</text>
+<path d="M250.0 136.0 H418.8 Q422.8 136.0 422.8 140.0 V146.0 Q422.8 150.0 418.8 150.0 H250.0 Z" class="f-faint"><title>FiLM Modulation: 0.0864</title></path>
+<text x="428.8" y="148.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">0.0864</text>
+<text x="240" y="174.0" text-anchor="end" class="f-ink2" font-size="13">Late-Stage Mamba</text>
+<path d="M250.0 162.0 H425.4 Q429.4 162.0 429.4 166.0 V172.0 Q429.4 176.0 425.4 176.0 H250.0 Z" class="f-faint"><title>Late-Stage Mamba: 0.0897</title></path>
+<text x="435.4" y="174.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">0.0897</text>
+<text x="240" y="200.0" text-anchor="end" class="f-ink2" font-size="13">Post-Net Refinement</text>
+<path d="M250.0 188.0 H437.6 Q441.6 188.0 441.6 192.0 V198.0 Q441.6 202.0 437.6 202.0 H250.0 Z" class="f-faint"><title>Post-Net Refinement: 0.0958</title></path>
+<text x="447.6" y="200.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">0.0958</text>
+<text x="240" y="226.0" text-anchor="end" class="f-ink2" font-size="13">Bottleneck Mamba</text>
+<path d="M250.0 214.0 H438.6 Q442.6 214.0 442.6 218.0 V224.0 Q442.6 228.0 438.6 228.0 H250.0 Z" class="f-faint"><title>Bottleneck Mamba: 0.0963</title></path>
+<text x="448.6" y="226.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">0.0963</text>
+<text x="240" y="252.0" text-anchor="end" class="f-ink2" font-size="13">Spectrogram Refinement (Pre-Net)</text>
+<path d="M250.0 240.0 H536.0 Q540.0 240.0 540.0 244.0 V250.0 Q540.0 254.0 536.0 254.0 H250.0 Z" class="f-faint"><title>Spectrogram Refinement (Pre-Net): 0.1450</title></path>
+<text x="546.0" y="252.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">0.1450</text>
+<text x="240" y="278.0" text-anchor="end" class="f-ink2" font-size="13">Sequential Progressive</text>
+<path d="M250.0 266.0 H572.4 Q576.4 266.0 576.4 270.0 V276.0 Q576.4 280.0 572.4 280.0 H250.0 Z" class="f-faint"><title>Sequential Progressive: 0.1632</title></path>
+<text x="582.4" y="278.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">0.1632</text>
+<text x="240" y="304.0" text-anchor="end" class="f-ink2" font-size="13">Multi-Rate Hybrid</text>
+<path d="M250.0 292.0 H585.0 Q589.0 292.0 589.0 296.0 V302.0 Q589.0 306.0 585.0 306.0 H250.0 Z" class="f-faint"><title>Multi-Rate Hybrid: 0.1695</title></path>
+<text x="595.0" y="304.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">0.1695</text>
+<text x="240" y="330.0" text-anchor="end" class="f-ink2" font-size="13">Concatenation Fusion</text>
+<path d="M250.0 318.0 H591.6 Q595.6 318.0 595.6 322.0 V328.0 Q595.6 332.0 591.6 332.0 H250.0 Z" class="f-faint"><title>Concatenation Fusion: 0.1728</title></path>
+<text x="601.6" y="330.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">0.1728</text>
+<text x="240" y="356.0" text-anchor="end" class="f-ink2" font-size="13">Mamba-SE (Squeeze-Excite)</text>
+<path d="M250.0 344.0 H630.4 Q634.4 344.0 634.4 348.0 V354.0 Q634.4 358.0 630.4 358.0 H250.0 Z" class="f-faint"><title>Mamba-SE (Squeeze-Excite): 0.1922</title></path>
+<text x="640.4" y="356.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">0.1922</text>
+<text x="403.2" y="16" class="f-ink2" font-size="12">HiFi-GAN baseline</text>
+</svg>
+</div>
+<div class="tall">
+<svg viewBox="0 0 360 568" role="img" aria-label="Final feature-matching loss of thirteen generator designs, sorted. Hybrid 1 Gated has the lowest, 0.0623; the HiFi-GAN baseline is 0.0736.">
+<path d="M16.0 22 V524" class="s-line" stroke-width="1" fill="none"/>
+<text x="16.0" y="540" text-anchor="middle" class="f-muted" font-size="11">0.00</text>
+<path d="M87.0 22 V524" class="s-line" stroke-width="1" fill="none"/>
+<text x="87.0" y="540" text-anchor="middle" class="f-muted" font-size="11">0.05</text>
+<path d="M158.0 22 V524" class="s-line" stroke-width="1" fill="none"/>
+<text x="158.0" y="540" text-anchor="middle" class="f-muted" font-size="11">0.10</text>
+<path d="M229.0 22 V524" class="s-line" stroke-width="1" fill="none"/>
+<text x="229.0" y="540" text-anchor="middle" class="f-muted" font-size="11">0.15</text>
+<path d="M300.0 22 V524" class="s-line" stroke-width="1" fill="none"/>
+<text x="300.0" y="540" text-anchor="middle" class="f-muted" font-size="11">0.20</text>
+<text x="158.0" y="560" text-anchor="middle" class="f-muted" font-size="12">Feature matching loss ↓</text>
+<path d="M120.5 18 V524" class="s-ink2" stroke-width="1.5" stroke-dasharray="4 3" fill="none"/>
+<text x="16" y="38" class="f-ink s-bg" stroke-width="4" paint-order="stroke" font-size="12" font-weight="600">Hybrid 1 Gated (Ours)</text>
+<path d="M16.0 44.0 H100.5 Q104.5 44.0 104.5 48.0 V51.0 Q104.5 55.0 100.5 55.0 H16.0 Z" class="f-accent"><title>Hybrid 1 Gated (Ours): 0.0623</title></path>
+<text x="110.5" y="53.5" class="f-ink s-bg" stroke-width="4" paint-order="stroke" font-size="11" font-weight="600">0.0623</text>
+<text x="16" y="76" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">Global Context Broadcasting</text>
+<path d="M16.0 82.0 H111.3 Q115.3 82.0 115.3 86.0 V89.0 Q115.3 93.0 111.3 93.0 H16.0 Z" class="f-faint"><title>Global Context Broadcasting: 0.0699</title></path>
+<text x="121.3" y="91.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="11">0.0699</text>
+<text x="16" y="114" class="f-ink s-bg" stroke-width="4" paint-order="stroke" font-size="12">HiFi-GAN Baseline</text>
+<path d="M16.0 120.0 H116.5 Q120.5 120.0 120.5 124.0 V127.0 Q120.5 131.0 116.5 131.0 H16.0 Z" class="f-ink2"><title>HiFi-GAN Baseline: 0.0736</title></path>
+<text x="126.5" y="129.5" class="f-ink s-bg" stroke-width="4" paint-order="stroke" font-size="11">0.0736</text>
+<text x="16" y="152" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">Dual-Path Decoupled</text>
+<path d="M16.0 158.0 H133.7 Q137.7 158.0 137.7 162.0 V165.0 Q137.7 169.0 133.7 169.0 H16.0 Z" class="f-faint"><title>Dual-Path Decoupled: 0.0857</title></path>
+<text x="143.7" y="167.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="11">0.0857</text>
+<text x="16" y="190" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">FiLM Modulation</text>
+<path d="M16.0 196.0 H134.7 Q138.7 196.0 138.7 200.0 V203.0 Q138.7 207.0 134.7 207.0 H16.0 Z" class="f-faint"><title>FiLM Modulation: 0.0864</title></path>
+<text x="144.7" y="205.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="11">0.0864</text>
+<text x="16" y="228" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">Late-Stage Mamba</text>
+<path d="M16.0 234.0 H139.4 Q143.4 234.0 143.4 238.0 V241.0 Q143.4 245.0 139.4 245.0 H16.0 Z" class="f-faint"><title>Late-Stage Mamba: 0.0897</title></path>
+<text x="149.4" y="243.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="11">0.0897</text>
+<text x="16" y="266" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">Post-Net Refinement</text>
+<path d="M16.0 272.0 H148.0 Q152.0 272.0 152.0 276.0 V279.0 Q152.0 283.0 148.0 283.0 H16.0 Z" class="f-faint"><title>Post-Net Refinement: 0.0958</title></path>
+<text x="158.0" y="281.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="11">0.0958</text>
+<text x="16" y="304" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">Bottleneck Mamba</text>
+<path d="M16.0 310.0 H148.7 Q152.7 310.0 152.7 314.0 V317.0 Q152.7 321.0 148.7 321.0 H16.0 Z" class="f-faint"><title>Bottleneck Mamba: 0.0963</title></path>
+<text x="158.7" y="319.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="11">0.0963</text>
+<text x="16" y="342" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">Spectrogram Refinement (Pre-Net)</text>
+<path d="M16.0 348.0 H217.9 Q221.9 348.0 221.9 352.0 V355.0 Q221.9 359.0 217.9 359.0 H16.0 Z" class="f-faint"><title>Spectrogram Refinement (Pre-Net): 0.1450</title></path>
+<text x="227.9" y="357.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="11">0.1450</text>
+<text x="16" y="380" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">Sequential Progressive</text>
+<path d="M16.0 386.0 H243.7 Q247.7 386.0 247.7 390.0 V393.0 Q247.7 397.0 243.7 397.0 H16.0 Z" class="f-faint"><title>Sequential Progressive: 0.1632</title></path>
+<text x="253.7" y="395.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="11">0.1632</text>
+<text x="16" y="418" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">Multi-Rate Hybrid</text>
+<path d="M16.0 424.0 H252.7 Q256.7 424.0 256.7 428.0 V431.0 Q256.7 435.0 252.7 435.0 H16.0 Z" class="f-faint"><title>Multi-Rate Hybrid: 0.1695</title></path>
+<text x="262.7" y="433.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="11">0.1695</text>
+<text x="16" y="456" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">Concatenation Fusion</text>
+<path d="M16.0 462.0 H257.4 Q261.4 462.0 261.4 466.0 V469.0 Q261.4 473.0 257.4 473.0 H16.0 Z" class="f-faint"><title>Concatenation Fusion: 0.1728</title></path>
+<text x="267.4" y="471.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="11">0.1728</text>
+<text x="16" y="494" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="12">Mamba-SE (Squeeze-Excite)</text>
+<path d="M16.0 500.0 H284.9 Q288.9 500.0 288.9 504.0 V507.0 Q288.9 511.0 284.9 511.0 H16.0 Z" class="f-faint"><title>Mamba-SE (Squeeze-Excite): 0.1922</title></path>
+<text x="294.9" y="509.5" class="f-ink2 s-bg" stroke-width="4" paint-order="stroke" font-size="11">0.1922</text>
+<text x="126.5" y="16" class="f-ink2" font-size="11">HiFi-GAN baseline</text>
+</svg>
+</div>
+<!-- /fig:designs -->
+<figcaption>The closest alternative, Global Context Broadcasting, reaches 0.0699 against gated fusion's 0.0623.</figcaption>
+</figure>
+
+<h2 id="samples">Samples</h2>
+<p>One LJSpeech utterance, reconstructed from its mel-spectrogram by each model.</p>
+<table>
+<colgroup><col style="width:42%"><col></colgroup>
+<tbody>
+<tr><td>Ground truth</td><td><audio controls preload="none" src="assets/audio/compare/ground_truth.wav"></audio></td></tr>
+<tr><td>Baseline (HiFi-GAN)</td><td><audio controls preload="none" src="assets/audio/compare/baseline.wav"></audio></td></tr>
+<tr><td>Hybrid 2 (Summation Fusion)</td><td><audio controls preload="none" src="assets/audio/compare/hybrid_summation.wav"></audio></td></tr>
+<tr class="ours"><td>Hybrid 1 (Mamba64 Gated)</td><td><audio controls preload="none" src="assets/audio/compare/hybrid_gated.wav"></audio></td></tr>
+<tr><td>Mamba Only (No Conv)</td><td><audio controls preload="none" src="assets/audio/compare/mamba_only.wav"></audio></td></tr>
+</tbody>
+</table>
+
+</main></body>
+</html>

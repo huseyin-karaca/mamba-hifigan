@@ -27,9 +27,6 @@ dependencies = [
 
 # mamba-ssm and causal-conv1d need a CUDA toolchain to build, so they are not installed automatically.
 # Install them separately:  pip install mamba-ssm "causal-conv1d>=1.2.0"
-[project.optional-dependencies]
-docs = ["mkdocs-material>=9.5"]
-
 [project.urls]
 Homepage = "https://hkaraca.com/mamba-hifigan/"
 Repository = "https://github.com/huseyin-karaca/mamba-hifigan"

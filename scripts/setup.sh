@@ -3,13 +3,13 @@
 #
 #   bash scripts/setup.sh /path/to/workdir
 #
-# Fetches SpeechBrain at the commit the project was built on, applies the recipe patch, installs this package
-# and downloads LJSpeech. Building mamba-ssm needs a CUDA toolchain and takes 30-40 minutes; that is normal.
+# Fetches SpeechBrain at the commit the project was built on, installs this repo's recipe script and this
+# package, and downloads LJSpeech. Building mamba-ssm needs a CUDA toolchain and takes 30-40 minutes.
 set -euo pipefail
 
 WORKDIR="${1:?usage: setup.sh /path/to/workdir}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PIN=637f0a55   # the SpeechBrain commit patches/ applies to
+PIN=637f0a55   # the SpeechBrain commit recipe/train.py is based on
 
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
@@ -22,18 +22,10 @@ else
   echo "==> speechbrain/ already present, leaving it alone"
 fi
 
-echo "==> applying the recipe patch (min_duration filtering, W&B logging)"
-# Only train.py is needed: the generators live in this package and import ResBlock1/ResBlock2 from
+echo "==> installing the recipe script (min_duration filtering, W&B logging)"
+# Only train.py is replaced: the generators live in this package and import ResBlock1/ResBlock2 from
 # SpeechBrain, so its model file stays untouched.
-if git -C speechbrain apply --check --reverse \
-      --include='recipes/LJSpeech/TTS/vocoder/hifigan/train.py' \
-      "$REPO/patches/speechbrain-637f0a55.patch" 2>/dev/null; then
-  echo "    already applied"
-else
-  git -C speechbrain apply \
-      --include='recipes/LJSpeech/TTS/vocoder/hifigan/train.py' \
-      "$REPO/patches/speechbrain-637f0a55.patch"
-fi
+cp "$REPO/recipe/train.py" speechbrain/recipes/LJSpeech/TTS/vocoder/hifigan/train.py
 
 echo "==> installing SpeechBrain and this package"
 pip install -e ./speechbrain
